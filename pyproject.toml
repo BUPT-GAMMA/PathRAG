@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PathRAG"
+version = "0.1.0"
+dependencies = [
+    "accelerate",
+    "aioboto3",
+    "aiohttp",
+    "graspologic",
+    "hnswlib",
+    "nano-vectordb",
+    "neo4j",
+    "networkx",
+    "ollama",
+    "openai",
+    "oracledb",
+    "psycopg[binary,pool]",
+    "pymilvus",
+    "pymongo",
+    "pymysql",
+    "pyvis",
+    "sqlalchemy",
+    "tenacity",
+    "tiktoken",
+    "torch",
+    "transformers",
+    "xxhash",
+]
