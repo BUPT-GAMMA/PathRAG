@@ -2,41 +2,38 @@ The code for the paper **"PathRAG: Pruning Graph-based Retrieval Augmented Gener
 ## Install
 ```bash
 cd PathRAG
-pip install -e .
+pip install -e . # or pip install -r requirements.txt 
 ```
+
+## RUN the project
+
+### Windows
+
+```bash
+python -m venv .venv    # create virtual environment
+.venv\Scripts\activate  # activate the virtual environment
+python v1_test.py       # to run the project
+
+# if it doesn't works properly then try reinstalling the packages using the above installation command
+```
+
+### Linux/Unix
+
+```bash
+python3 -m venv .venv    # create virtual environment
+Source .venv\bin\activate  # activate the virtual environment
+python3 v1_test.py       # to run the project
+
+# if it doesn't works properly then try reinstalling the packages using the above installation command
+```
+
 ## Quick Start
 * You can quickly experience this project in the `v1_test.py` file.
-* Set OpenAI API key in environment if using OpenAI models: `api_key="sk-...".` in the `v1_test.py` and `llm.py` file
-* Prepare your retrieval document "text.txt".
-* Use the following Python snippet in the "v1_text.py" file to initialize PathRAG and perform queries.
+* Rename `exampe.env` to `.env`
+* Set OpenAI API key in `.env` file and the BASE URL.
+* Prepare your retrieval document `text.txt`. You can modify this in the code in `v1_test.py`.
+* The `v1_text.py` file is the entry point to initialize PathRAG and perform queries.
   
-```python
-import os
-from PathRAG import PathRAG, QueryParam
-from PathRAG.llm import gpt_4o_mini_complete
-
-WORKING_DIR = "./your_working_dir"
-api_key="your_api_key"
-os.environ["OPENAI_API_KEY"] = api_key
-base_url="https://api.openai.com/v1"
-os.environ["OPENAI_API_BASE"]=base_url
-
-
-if not os.path.exists(WORKING_DIR):
-    os.mkdir(WORKING_DIR)
-
-rag = PathRAG(
-    working_dir=WORKING_DIR,
-    llm_model_func=gpt_4o_mini_complete,  
-)
-
-data_file="./text.txt"
-question="your_question"
-with open(data_file) as f:
-    rag.insert(f.read())
-
-print(rag.query(question, param=QueryParam(mode="hybrid")))
-```
 ## Parameter modification
 You can adjust the relevant parameters in the `base.py` and `operate.py` files.
 

@@ -1,0 +1,9 @@
+*.log
+__pycache__
+*.graphml
+*.json
+.env
+
+graph
+kv_store
+vdb

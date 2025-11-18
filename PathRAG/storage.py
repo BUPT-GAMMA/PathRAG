@@ -21,12 +21,15 @@ from .base import (
     BaseVectorStorage,
 )
 
+from .settings import KV_STORE_FILE_PATH
+from .settings import GRAPH_FILE_PATH
+from .settings import VDB_FILE__PATH
+
 
 @dataclass
 class JsonKVStorage(BaseKVStorage):
     def __post_init__(self):
-        working_dir = self.global_config["working_dir"]
-        self._file_name = os.path.join(working_dir, f"kv_store_{self.namespace}.json")
+        self._file_name = os.path.join(KV_STORE_FILE_PATH, f"kv_store_{self.namespace}.json")
         self._data = load_json(self._file_name) or {}
         logger.info(f"Load KV {self.namespace} with {len(self._data)} data")
 
@@ -68,9 +71,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
     cosine_better_than_threshold: float = 0.2
 
     def __post_init__(self):
-        self._client_file_name = os.path.join(
-            self.global_config["working_dir"], f"vdb_{self.namespace}.json"
-        )
+        self._client_file_name = os.path.join(VDB_FILE__PATH, f"vdb_{self.namespace}.json")
         self._max_batch_size = self.global_config["embedding_batch_num"]
         self._client = NanoVectorDB(
             self.embedding_func.embedding_dim, storage_file=self._client_file_name
@@ -242,9 +243,7 @@ class NetworkXStorage(BaseGraphStorage):
         return fixed_graph
 
     def __post_init__(self):
-        self._graphml_xml_file = os.path.join(
-            self.global_config["working_dir"], f"graph_{self.namespace}.graphml"
-        )
+        self._graphml_xml_file = os.path.join(GRAPH_FILE_PATH, f"graph_{self.namespace}.graphml")
         preloaded_graph = NetworkXStorage.load_nx_graph(self._graphml_xml_file)
         if preloaded_graph is not None:
             logger.info(

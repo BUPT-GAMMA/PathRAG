@@ -37,8 +37,12 @@ from .utils import (
     logger,
 )
 
+from dotenv import load_dotenv
+
 import sys
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+load_dotenv()
 
 if sys.version_info < (3, 9):
     from typing import AsyncIterator
@@ -58,8 +62,8 @@ async def openai_complete_if_cache(
     prompt,
     system_prompt=None,
     history_messages=[],
-    base_url="https://api.openai.com/v1",
-    api_key="",
+    base_url=os.getenv("BASE_URL"),
+    api_key=os.getenv("API_KEY"),
     **kwargs,
 ) -> str:
     if api_key:
@@ -782,8 +786,8 @@ async def zhipu_embedding(
 async def openai_embedding(
     texts: list[str],
     model: str = "text-embedding-3-small",
-    base_url="https://api.openai.com/v1",
-    api_key="",
+    base_url=os.getenv("BASE_URL"),
+    api_key=os.getenv("API_KEY"),
 ) -> np.ndarray:
     if api_key:
         os.environ["OPENAI_API_KEY"] = api_key
