@@ -52,6 +52,16 @@ for file_name in txt_files:
         rag.insert(file.read())
 ```
 
+## Graph Visualization
+Once your files were processed, you may visualize how the graph looks like.
+1. Ensure the file `graph_chunk_entity_relation.graphml` has been written during the main indexation. 
+2. Run `visualize_graph.py`. 
+
+It will create an HTML of your graph. Feel free to open it on your favorite browser.
+* The edge labels are the relationship strength.
+* All nodes have tooltips with their category, description and chunk source.
+
+
 ## Cite
 Please cite our paper if you use this code in your own work:
 ```python
