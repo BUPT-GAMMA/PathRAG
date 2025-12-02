@@ -12,6 +12,8 @@ import numpy as np
 import ollama
 import torch
 import time
+import modelscope as ms
+from vllm import LLM
 from openai import (
     AsyncOpenAI,
     APIConnectionError,
@@ -36,6 +38,7 @@ from .utils import (
 )
 
 import sys
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 if sys.version_info < (3, 9):
     from typing import AsyncIterator
@@ -223,16 +226,32 @@ async def bedrock_complete_if_cache(
 
 @lru_cache(maxsize=1)
 def initialize_hf_model(model_name):
-    hf_tokenizer = AutoTokenizer.from_pretrained(
-        model_name, device_map="auto", trust_remote_code=True
-    )
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_name, device_map="auto", trust_remote_code=True
-    )
-    if hf_tokenizer.pad_token is None:
-        hf_tokenizer.pad_token = hf_tokenizer.eos_token
+    # 是否使用 GPU，如果无 GPU 则回退到 CPU
+    use_gpu = torch.cuda.is_available()
+    dtype = torch.bfloat16 if use_gpu else torch.float32
+    device_map = "auto" if use_gpu else "cpu"
 
-    return hf_model, hf_tokenizer
+    # 加载 tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        use_fast=False  # 有些模型如 Qwen 不支持 fast tokenizer
+    )
+
+    # 加载模型
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+        device_map=device_map,
+        low_cpu_mem_usage=True
+    )
+
+    # 设置 pad_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer
 
 
 @retry(
@@ -290,15 +309,14 @@ async def hf_model_if_cache(
 
     input_ids = hf_tokenizer(
         input_prompt, return_tensors="pt", padding=True, truncation=True
-    ).to("cuda")
+    )#修改.to("cuda")
     inputs = {k: v.to(hf_model.device) for k, v in input_ids.items()}
     output = hf_model.generate(
-        **input_ids, max_new_tokens=512, num_return_sequences=1, early_stopping=True
+        **input_ids, max_new_tokens=512, num_return_sequences=1
     )
     response_text = hf_tokenizer.decode(
         output[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True
     )
-
     return response_text
 
 
@@ -993,6 +1011,37 @@ async def hf_embedding(texts: list[str], tokenizer, embed_model) -> np.ndarray:
     else:
         return embeddings.detach().cpu().numpy()
 
+async def ms_embedding(texts: list[str], tokenizer, embed_model) -> np.ndarray:
+    device = next(embed_model.parameters()).device
+    input_ids = tokenizer(
+        texts, return_tensors="pt", padding=True, truncation=True
+    ).input_ids.to(device)
+    with torch.no_grad():
+        outputs = embed_model(input_ids)
+        embeddings = outputs.last_hidden_state.mean(dim=1)
+    if embeddings.dtype == torch.bfloat16:
+        return embeddings.detach().to(torch.float32).cpu().numpy()
+    else:
+        return embeddings.detach().cpu().numpy()
+
+async def local_embedding(texts: list[str], tokenizer=None, embed_model=None) -> np.ndarray:
+    if tokenizer is None or embed_model is None:
+        raise ValueError("Tokenizer and model must be provided")
+    device = next(embed_model.parameters()).device
+    encoded = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        return_tensors="pt"
+    ).input_ids.to(device)
+    with torch.no_grad():
+        outputs = embed_model(encoded)
+        embeddings = outputs.last_hidden_state.mean(dim=1)
+    if embeddings.dtype == torch.bfloat16:
+        return embeddings.detach().to(torch.float32).cpu().numpy()
+    else:
+        return embeddings.detach().cpu().numpy()
+
 
 async def ollama_embedding(texts: list[str], embed_model, **kwargs) -> np.ndarray:
     """
@@ -1011,6 +1060,313 @@ async def ollama_embed(texts: list[str], embed_model, **kwargs) -> np.ndarray:
     ollama_client = ollama.Client(**kwargs)
     data = ollama_client.embed(model=embed_model, input=texts)
     return data["embeddings"]
+
+
+
+@lru_cache(maxsize=1)
+def initialize_ms_model(model_name: str):
+    """加载 ModelScope 聊天模型并缓存（底层实现）"""
+    tokenizer = ms.AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = ms.AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True
+    ).to(device).eval()
+    return tokenizer, model
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((RateLimitError, APIConnectionError, Timeout)),
+)
+async def ms_model_if_cache(
+    model: str,
+    prompt: str,
+    system_prompt: str = None,
+    history_messages: list = [],
+    **kwargs,
+) -> str:
+    tokenizer, model = initialize_ms_model(model)
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": prompt})
+    kwargs.pop("hashing_kv", None)
+    input_prompt = ""
+    try:
+        input_prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        try:
+            ori_message = copy.deepcopy(messages)
+            if messages[0]["role"] == "system":
+                messages[1]["content"] = (
+                    "<system>"
+                    + messages[0]["content"]
+                    + "</system>\n"
+                    + messages[1]["content"]
+                )
+                messages = messages[1:]
+                input_prompt = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+        except Exception:
+            len_message = len(ori_message)
+            for msgid in range(len_message):
+                input_prompt = (
+                    input_prompt
+                    + "<"
+                    + ori_message[msgid]["role"]
+                    + ">"
+                    + ori_message[msgid]["content"]
+                    + "</"
+                    + ori_message[msgid]["role"]
+                    + ">\n"
+                )
+
+    input_ids = tokenizer(
+        input_prompt, return_tensors="pt", padding=True, truncation=True
+    ).to(device)
+    inputs = {k: v.to(model.device) for k, v in input_ids.items()}
+    output = model.generate(
+        **input_ids, max_new_tokens=512, num_return_sequences=1
+    )
+    response_text = tokenizer.decode(
+        output[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True
+    )
+    return response_text
+
+
+
+
+async def ms_model_complete(
+    prompt: str,
+    system_prompt: str = None,
+    history_messages: list = [],
+    keyword_extraction: bool = False,
+    **kwargs,
+) -> str:
+    keyword_extraction = kwargs.pop("keyword_extraction", None)
+    model_name = kwargs["hashing_kv"].global_config["llm_model_name"]
+    result = await ms_model_if_cache(
+        model_name,
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        **kwargs,
+    )
+    # print("ms_res",result)
+    if keyword_extraction:
+        return locate_json_string_body_from_string(result)
+    
+    return result
+
+
+
+@lru_cache(maxsize=1)
+def initialize_local_model(model_path: str):
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    ).to(device).eval()
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((RateLimitError, APIConnectionError, Timeout)),
+)
+async def local_model_if_cache(
+    model,
+    prompt,
+    system_prompt=None,
+    history_messages=[],
+    **kwargs,
+) -> str:
+    model_name = model
+    local_model, local_tokenizer = initialize_local_model(model_name)
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": prompt})
+    kwargs.pop("hashing_kv", None)
+    input_prompt = ""
+    try:
+        input_prompt = local_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        try:
+            ori_message = copy.deepcopy(messages)
+            if messages[0]["role"] == "system":
+                messages[1]["content"] = (
+                    "<system>"
+                    + messages[0]["content"]
+                    + "</system>\n"
+                    + messages[1]["content"]
+                )
+                messages = messages[1:]
+                input_prompt = local_tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+        except Exception:
+            len_message = len(ori_message)
+            for msgid in range(len_message):
+                input_prompt = (
+                    input_prompt
+                    + "<"
+                    + ori_message[msgid]["role"]
+                    + ">"
+                    + ori_message[msgid]["content"]
+                    + "</"
+                    + ori_message[msgid]["role"]
+                    + ">\n"
+                )
+    input_ids = local_tokenizer(
+        input_prompt, return_tensors="pt", padding=True, truncation=True
+    ).to(device)
+    inputs = {k: v.to(local_model.device) for k, v in input_ids.items()}
+    output = local_model.generate(
+        **input_ids, max_new_tokens=512, num_return_sequences=1
+    )
+    response_text = local_tokenizer.decode(
+        output[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True
+    )
+    # print("response_text",response_text)#修改
+    return response_text
+
+async def local_model_complete(
+    prompt: str,
+    system_prompt: str = None,
+    history_messages: list = [],
+    keyword_extraction: bool = False,
+    **kwargs,
+) -> str:
+    keyword_extraction = kwargs.pop("keyword_extraction", None)
+    model_path = kwargs["hashing_kv"].global_config["llm_model_name"]
+    result = await local_model_if_cache(
+        model_path,
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        **kwargs,
+    )
+    if keyword_extraction:
+        result= locate_json_string_body_from_string(result)
+    return result
+
+
+@lru_cache(maxsize=1)
+def initialize_vllm_model(model_name: str):
+    """加载 vLLM 聊天模型并缓存"""
+    model = LLM(model_name, device=device, max_model_len=8192)#修改
+    return model
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((RateLimitError, APIConnectionError, Timeout)),
+)
+async def vllm_model_if_cache(
+    model: str,
+    prompt: str,
+    system_prompt: str = None,
+    history_messages: list = [],
+    **kwargs,
+) -> str:
+    vllm_model = initialize_vllm_model(model)
+
+    # 构建多轮对话格式
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.extend(history_messages)
+    messages.append({"role": "user", "content": prompt})
+    kwargs.pop("hashing_kv", None)
+    input_prompt = ""
+    try:
+        result = vllm_model.chat(messages)
+    except Exception:
+        try:
+            ori_message = copy.deepcopy(messages)
+            if messages[0]["role"] == "system":
+                messages[1]["content"] = (
+                    "<system>"
+                    + messages[0]["content"]
+                    + "</system>\n"
+                    + messages[1]["content"]
+                )
+                messages = messages[1:]
+                result = vllm_model.chat(messages)
+        except Exception:
+            len_message = len(ori_message)
+            for msgid in range(len_message):
+                result = (
+                    result
+                    + "<"
+                    + ori_message[msgid]["role"]
+                    + ">"
+                    + ori_message[msgid]["content"]
+                    + "</"
+                    + ori_message[msgid]["role"]
+                    + ">\n"
+                )
+    return result[0].outputs[0].text
+
+
+
+async def vllm_model_complete(
+    prompt: str,
+    system_prompt: str = None,
+    history_messages: list = [],
+    keyword_extraction: bool = False,
+    **kwargs,
+) -> str:
+    keyword_extraction = kwargs.pop("keyword_extraction", None)
+    model_name = kwargs["hashing_kv"].global_config["llm_model_name"]
+    result = await vllm_model_if_cache(
+        model_name,
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        **kwargs,
+    )
+    if keyword_extraction:
+        return locate_json_string_body_from_string(result)
+    return result
+
+
+async def vllm_embedding(texts: list[str], tokenizer, embed_model) -> np.ndarray:
+    device = next(embed_model.parameters()).device
+    input_ids = tokenizer(
+        texts, return_tensors="pt", padding=True, truncation=True
+    ).input_ids.to(device)
+    with torch.no_grad():
+        outputs = embed_model(input_ids)
+        embeddings = outputs.last_hidden_state.mean(dim=1)
+    if embeddings.dtype == torch.bfloat16:
+        return embeddings.detach().to(torch.float32).cpu().numpy()
+    else:
+        return embeddings.detach().cpu().numpy()
+
+
+
+
+
+
+
+
 
 
 class Model(BaseModel):
@@ -1099,6 +1455,5 @@ if __name__ == "__main__":
 
     async def main():
         result = await gpt_4o_mini_complete("How are you?")
-        print(result)
 
     asyncio.run(main())
