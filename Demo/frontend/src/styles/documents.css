@@ -1,0 +1,234 @@
+/* Documents Page */
+.documents-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+/* Document Uploader */
+.document-uploader {
+  margin-bottom: 20px;
+}
+
+.dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 8px;
+  padding: 30px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  margin-bottom: 15px;
+}
+
+.dropzone.active {
+  border-color: var(--primary);
+  background-color: rgba(var(--primary-rgb), 0.05);
+}
+
+.dropzone.disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.upload-prompt {
+  padding: 20px;
+}
+
+.upload-note {
+  font-size: 0.9rem;
+  color: var(--textMuted);
+  margin-top: 10px;
+}
+
+.upload-progress {
+  padding: 15px;
+}
+
+.upload-status-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 15px;
+}
+
+.status-label {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-weight: 500;
+  font-size: 0.9rem;
+}
+
+.status-label.uploading {
+  background-color: #f5a623;
+  color: white;
+}
+
+.status-label.processing {
+  background-color: #2196f3;
+  color: white;
+}
+
+.status-label.completed {
+  background-color: #4caf50;
+  color: white;
+}
+
+.status-label.failed {
+  background-color: #f44336;
+  color: white;
+}
+
+.status-message {
+  margin-top: 15px;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.upload-success {
+  margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.upload-reloading {
+  margin-top: 15px;
+  display: flex;
+  align-items: center;
+}
+
+.upload-reloading .rs-message {
+  width: 100%;
+  display: flex;
+  align-items: center;
+}
+
+/* Upload Progress Panel */
+.upload-progress-panel {
+  margin-bottom: 15px;
+}
+
+.upload-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 15px;
+}
+
+.upload-progress-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.progress-percentage {
+  min-width: 40px;
+  text-align: right;
+  font-weight: 500;
+}
+
+.upload-progress-message {
+  font-size: 0.9rem;
+  color: var(--textMuted);
+}
+
+/* Document List */
+.document-list {
+  width: 100%;
+  margin-bottom: 20px;
+  display: block;
+}
+
+.document-list .rs-panel-body {
+  width: 100%;
+  padding: 0;
+}
+
+.document-list .rs-table {
+  width: 100% !important;
+}
+
+.document-list .rs-table-body-row-wrapper,
+.document-list .rs-table-header-row-wrapper,
+.document-list .rs-table-row,
+.document-list .rs-table-cell-group,
+.document-list .rs-table-cell {
+  width: 100% !important;
+}
+
+/* Fix for NaN width issue */
+.document-list [style*="NaN"] {
+  width: auto !important;
+}
+
+.document-status-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  text-align: center;
+  color: white;
+}
+
+.document-status-badge.processing {
+  background-color: #2196F3;
+}
+
+.document-status-badge.completed {
+  background-color: #4CAF50;
+}
+
+.document-status-badge.failed {
+  background-color: #F44336;
+}
+
+.document-status-badge.uploading {
+  background-color: #FF9800;
+}
+
+.document-card {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.document-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.document-card-body {
+  flex: 1;
+}
+
+.document-card-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: auto;
+}
+
+.document-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 0.9rem;
+  color: var(--textMuted);
+}
+
+.document-actions {
+  display: flex;
+  gap: 10px;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .document-list {
+    grid-template-columns: 1fr;
+  }
+}
