@@ -1,0 +1,98 @@
+#huggingface
+rag = PathRAG(
+    working_dir=WORKING_DIR,
+    llm_model_func=hf_model_complete,
+    llm_model_name="Qwen/Qwen3-0.6B",
+    embedding_func=EmbeddingFunc(
+        embedding_dim=384, 
+        max_token_size=5000,
+        func=lambda texts: hf_embedding(
+            texts,
+            tokenizer=AutoTokenizer.from_pretrained(
+                "sentence-transformers/all-MiniLM-L6-v2"
+            ),
+            embed_model=AutoModel.from_pretrained(
+                "sentence-transformers/all-MiniLM-L6-v2"
+            ),
+        ),
+    ),
+)
+#local
+rag = PathRAG(
+    working_dir=WORKING_DIR,
+    llm_model_func=local_model_complete,
+    llm_model_name="./modelscope/Qwen3-0.6B",
+    embedding_func=EmbeddingFunc(
+        embedding_dim=384,
+        max_token_size=5000,
+        func=lambda texts: local_embedding(
+            texts,
+            tokenizer=AutoTokenizer.from_pretrained("./modelscope/all-MiniLM-L6-v2"),
+            embed_model=AutoModel.from_pretrained("./modelscope/all-MiniLM-L6-v2"),
+        ),
+    ),
+)
+#modelscope
+tokenizer = ms.AutoTokenizer.from_pretrained(
+    "iic/nlp_corom_sentence-embedding_english-base",
+    trust_remote_code=True
+)
+model = ms.AutoModel.from_pretrained(
+    "iic/nlp_corom_sentence-embedding_english-base",
+    trust_remote_code=True
+).to("cuda" if torch.cuda.is_available() else "cpu").eval()
+rag = PathRAG(
+    working_dir=WORKING_DIR,
+    llm_model_func=ms_model_complete,
+    llm_model_name="Qwen/Qwen3-0.6B",
+    embedding_func=EmbeddingFunc(
+        embedding_dim=768,  # corom 模型输出维度
+        max_token_size=5000,
+        func=lambda texts: ms_embedding(
+            texts,
+            tokenizer,
+            model, 
+        ),
+    ),
+)
+#vllm
+rag = PathRAG(
+    working_dir=WORKING_DIR,
+    llm_model_func=vllm_model_complete,
+    llm_model_name="./modelscope/Qwen3-0.6B",
+    embedding_func=EmbeddingFunc(
+        embedding_dim=384, 
+        max_token_size=5000,
+        func=lambda texts: vllm_embedding(
+            texts,
+            tokenizer=AutoTokenizer.from_pretrained(
+                "./modelscope/all-MiniLM-L6-v2"
+            ),
+            embed_model=AutoModel.from_pretrained(
+                "./modelscope/all-MiniLM-L6-v2"
+            ),
+        ),
+    ),
+)
+#ollama
+rag = PathRAG(
+        working_dir=WORKING_DIR,
+        llm_model_func=ollama_model_complete,
+        llm_model_name=os.getenv("LLM_MODEL", "qwen3:0.6b"),
+        llm_model_max_token_size=8192,
+        llm_model_kwargs={
+            "host": os.getenv("LLM_BINDING_HOST", "http://localhost:11434"),
+            "options": {"num_ctx": 8192},
+            "timeout": int(os.getenv("TIMEOUT", "300")),
+        },
+        embedding_func=EmbeddingFunc(
+            embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
+            max_token_size=int(os.getenv("MAX_EMBED_TOKENS", "8192")),
+            func=lambda texts: ollama_embedding(
+                texts,
+                embed_model=os.getenv("EMBEDDING_MODEL", "bge-large"),
+                host=os.getenv("EMBEDDING_BINDING_HOST", "http://localhost:11434"),
+            ),
+        ),
+    )
+
