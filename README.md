@@ -137,11 +137,11 @@ Python Version: Python 3.10.18
 cd PathRAG
 pip install -e .
 ```
-- use OpenAI API key
+- Use OpenAI API key
 - You can quickly experience this project in the `v1_test.py` file.
-- Set OpenAI API key in environment if using OpenAI models: `api_key="sk-...".` in the `v1_test.py` and `llm.py` file
+- Set OpenAI API key in environment if using OpenAI models: `api_key="sk-...".` in the `v1_test.py` and `llm.py` file.
 - Prepare your retrieval document "text.txt".
--  Use the following Python snippet in the `v1_test.py` file to initialize PathRAG and perform queries.
+- Use the following Python snippet in the `v1_test.py` file to initialize PathRAG and perform queries.
   
 ```python
 import os
@@ -171,11 +171,12 @@ with open(data_file) as f:
 print(rag.query(question, param=QueryParam(mode="hybrid")))
 ```
 ##### Quick Start with models from different sources
-- You can use the model from huggingface, ollama, modelscope, local and vllm
-- You can quickly experience this project in the `rag_test.py` file
-- Select your model source—— hf / vllm / ollama / ms / local
+- You can use the model from huggingface, ollama, modelscope, local and vllm.
+- You can quickly experience this project in the `rag_test.py` file.
+- Select your model source—— hf / vllm / ollama / ms / local.
 - Prepare your llm_model，embedding_model and  retrieval document "your data file" . 
-- Use the following Python snippet in the `rag_test.py` file to use models from different sources
+- Use the following Python snippet in the `rag_test.py` file to use models from different sources.
+- Detailed examples can be referred to `examples.txt`.
 
 ```Python
 import os
