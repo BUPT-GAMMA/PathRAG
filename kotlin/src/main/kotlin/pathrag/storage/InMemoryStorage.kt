@@ -8,6 +8,7 @@ import pathrag.base.BaseVectorStorage
 import pathrag.utils.EmbeddingFunc
 import pathrag.utils.computeMdHashId
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 class JsonKVStorage<T : Any>(
     override val namespace: String,
@@ -173,4 +174,92 @@ class NetworkXStorage(
     override suspend fun nodes(): List<String> = nodes.keys().toList()
 
     override suspend fun edges(): List<Pair<String, String>> = edges.keys.toList()
+
+    override suspend fun getPagerank(nodeId: String): Double {
+        val ranks = computePagerank()
+        return ranks[nodeId] ?: 0.0
+    }
+
+    override suspend fun embedNodes(algorithm: String): Pair<DoubleArray, List<String>> {
+        val labels = nodes.keys().toList()
+        if (labels.isEmpty()) return DoubleArray(0) to emptyList()
+        return when (algorithm.lowercase()) {
+            "node2vec" -> runNode2Vec(labels)
+            else -> runMetadataEmbedding(labels)
+        }
+    }
+
+    private suspend fun runMetadataEmbedding(labels: List<String>): Pair<DoubleArray, List<String>> {
+        val func = embeddingFunc
+        return if (func != null) {
+            val texts =
+                labels.map { id ->
+                    val n = nodes[id] ?: emptyMap()
+                    val desc = n["description"]?.toString().orEmpty()
+                    "$id ${n["entity_type"] ?: ""} $desc"
+                }
+            val vectors = func(texts)
+            val flat = vectors.flatMap { it.asIterable() }.toDoubleArray()
+            flat to labels
+        } else {
+            val ranks = computePagerank()
+            val degs = labels.map { nodeDegree(it).toDouble() }
+            val vecs =
+                labels.mapIndexed { idx, id ->
+                    doubleArrayOf(ranks[id] ?: 0.0, degs[idx])
+                }
+            val flat = vecs.flatMap { it.asIterable() }.toDoubleArray()
+            flat to labels
+        }
+    }
+
+    private suspend fun runNode2Vec(labels: List<String>): Pair<DoubleArray, List<String>> {
+        val dim = globalConfig["node2vec_dim"] as? Int ?: 64
+        if (labels.isEmpty()) return DoubleArray(0) to emptyList()
+        val ranks = computePagerank()
+        val degs = labels.map { nodeDegree(it).toDouble() }
+        val vectors =
+            labels.mapIndexed { idx, id ->
+                DoubleArray(dim) { i ->
+                    val r = ranks[id] ?: 0.0
+                    val d = degs[idx]
+                    if (i % 2 == 0) r else d
+                }
+            }
+        val flat = vectors.flatMap { it.asIterable() }.toDoubleArray()
+        return flat to labels
+    }
+
+    private fun computePagerank(
+        damping: Double = 0.85,
+        maxIter: Int = 100,
+        tol: Double = 1e-6,
+    ): Map<String, Double> {
+        val nodesList = nodes.keys().toList()
+        if (nodesList.isEmpty()) return emptyMap()
+        val n = nodesList.size
+        val rank = mutableMapOf<String, Double>()
+        nodesList.forEach { rank[it] = 1.0 / n }
+
+        repeat(maxIter) {
+            var diff = 0.0
+            val newRank = mutableMapOf<String, Double>()
+            for (node in nodesList) {
+                val neighbors = edges.keys.filter { it.first == node || it.second == node }
+                val outDeg = neighbors.size
+                val share = if (outDeg == 0) 0.0 else rank[node]!! / outDeg
+                neighbors.forEach { (u, v) ->
+                    val dest = if (u == node) v else u
+                    newRank[dest] = (newRank[dest] ?: 0.0) + share
+                }
+            }
+            for (node in nodesList) {
+                val updated = (1 - damping) / n + damping * (newRank[node] ?: 0.0)
+                diff += abs(updated - (rank[node] ?: 0.0))
+                rank[node] = updated
+            }
+            if (diff < tol) return rank
+        }
+        return rank
+    }
 }

@@ -22,6 +22,7 @@ import pathrag.utils.Tokenizer
 import pathrag.utils.computeArgsHash
 import pathrag.utils.computeMdHashId
 import kotlin.math.min
+import kotlin.math.pow
 
 private val logger = KotlinLogging.logger("PathRAG-Operate")
 private typealias LlmFunc =
@@ -548,6 +549,21 @@ private suspend fun scorePaths(
     paths: List<List<String>>,
     knowledgeGraphInst: BaseGraphStorage,
 ): List<Pair<List<String>, Double>> {
+    if (paths.isEmpty()) return emptyList()
+
+    fun normalizedEdge(
+        u: String,
+        v: String,
+    ): Pair<String, String> = if (u <= v) u to v else v to u
+
+    val edgeCounts = mutableMapOf<Pair<String, String>, Int>()
+    paths.forEach { path ->
+        path.windowed(2).forEach { (u, v) ->
+            val key = normalizedEdge(u, v)
+            edgeCounts[key] = (edgeCounts[key] ?: 0) + 1
+        }
+    }
+
     suspend fun edgeWeight(
         u: String,
         v: String,
@@ -555,28 +571,37 @@ private suspend fun scorePaths(
         val edge = knowledgeGraphInst.getEdge(u, v) ?: knowledgeGraphInst.getEdge(v, u)
         val weight = (edge?.get("weight") as? Number)?.toDouble() ?: 1.0
         val degree = knowledgeGraphInst.edgeDegree(u, v).toDouble()
-        return weight + degree
+        val freq = edgeCounts[normalizedEdge(u, v)]?.toDouble() ?: 0.0
+        return weight + degree + freq
     }
 
     suspend fun pathScore(path: List<String>): Double {
         if (path.size < 2) return 0.0
-        val pageranks = path.map { knowledgeGraphInst.getPagerank(it) }
-        val avgPagerank = pageranks.average()
-
         var edgeSum = 0.0
         for (i in 0 until path.lastIndex) {
             edgeSum += edgeWeight(path[i], path[i + 1])
         }
         val edgeAvg = edgeSum / (path.size - 1)
-        return avgPagerank + edgeAvg
+        val hop = path.size - 1
+        val decay = 0.8.pow((hop - 1).coerceAtLeast(0))
+        return edgeAvg * decay
     }
 
-    val scored = mutableListOf<Pair<List<String>, Double>>()
-    for (p in paths) {
-        val score = pathScore(p)
-        scored.add(p to score)
+    val scored =
+        paths
+            .map { path -> path to pathScore(path) }
+            .sortedByDescending { it.second }
+
+    val byHop = scored.groupBy { it.first.size - 1 }
+    val selected = mutableListOf<Pair<List<String>, Double>>()
+    (1..3).forEach { hop ->
+        byHop[hop]?.take(5)?.let { selected.addAll(it) }
     }
-    return scored.sortedByDescending { it.second }
+    if (selected.size < 15) {
+        val already = selected.map { it.first }.toSet()
+        selected.addAll(scored.filterNot { it.first in already }.take(15 - selected.size))
+    }
+    return selected.distinctBy { it.first }
 }
 
 private suspend fun runGlobalMode(

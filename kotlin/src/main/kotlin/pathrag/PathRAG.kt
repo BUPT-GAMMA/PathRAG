@@ -27,6 +27,21 @@ class PathRAG(
     private val graphStorage: String = "NetworkXStorage",
     private val chunkTokenSize: Int = 1200,
     private val chunkOverlapTokenSize: Int = 100,
+    private val language: String = System.getenv("LANGUAGE") ?: "English",
+    private val keywordExamples: String = System.getenv("KEYWORDS_EXAMPLES") ?: "",
+    private val similarityCheckPrompt: String = System.getenv("SIMILARITY_CHECK_PROMPT") ?: pathrag.prompt.Prompts.SIMILARITY_CHECK,
+    private val embeddingCacheConfig: Map<String, Any?> =
+        mapOf(
+            "enabled" to (System.getenv("EMBEDDING_CACHE_ENABLED")?.toBoolean() ?: false),
+            "similarity_threshold" to (System.getenv("EMBEDDING_CACHE_SIM_THRESHOLD")?.toDoubleOrNull() ?: 0.95),
+            "use_llm_check" to (System.getenv("EMBEDDING_CACHE_USE_LLM_CHECK")?.toBoolean() ?: false),
+        ),
+    private val addonParams: Map<String, Any?> =
+        mapOf(
+            "entity_types" to (System.getenv("ENTITY_TYPES")?.split(",")?.map { it.trim() } ?: emptyList<String>()),
+            "language" to (System.getenv("LANGUAGE") ?: "English"),
+            "example_number" to (System.getenv("KEYWORD_EXAMPLE_COUNT")?.toIntOrNull()),
+        ),
 ) {
     private val logger = KotlinLogging.logger("PathRAG")
     private val llmModelName: String = System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini"
@@ -80,6 +95,12 @@ class PathRAG(
             "llm_model_func" to llmModelFunc,
             "chunk_token_size" to chunkTokenSize,
             "chunk_overlap_token_size" to chunkOverlapTokenSize,
+            "language" to language,
+            "keywords_examples" to keywordExamples,
+            "embedding_cache_config" to embeddingCacheConfig,
+            "addon_params" to addonParams,
+            "llm_model_name" to llmModelName,
+            "similarity_check_prompt" to similarityCheckPrompt,
         )
 
     fun insert(stringOrStrings: Any) = runBlockingMaybe { ainsert(stringOrStrings) }

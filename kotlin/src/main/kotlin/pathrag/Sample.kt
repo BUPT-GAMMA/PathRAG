@@ -11,7 +11,27 @@ import kotlinx.coroutines.runBlocking
  */
 fun main() =
     runBlocking {
-        val rag = PathRAG()
+        val rag =
+            PathRAG(
+                workingDir = "./sample_cache",
+                chunkTokenSize = 800,
+                chunkOverlapTokenSize = 120,
+                language = "English",
+                keywordExamples = "",
+                similarityCheckPrompt = pathrag.prompt.Prompts.SIMILARITY_CHECK,
+                embeddingCacheConfig =
+                    mapOf(
+                        "enabled" to true,
+                        "similarity_threshold" to 0.9,
+                        "use_llm_check" to false,
+                    ),
+                addonParams =
+                    mapOf(
+                        "entity_types" to listOf("organization", "person", "geo", "event", "category"),
+                        "language" to "English",
+                        "example_number" to 3,
+                    ),
+            )
 
         // Insert demo content (replace with real documents).
         rag.insert(

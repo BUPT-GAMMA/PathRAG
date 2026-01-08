@@ -195,8 +195,11 @@ class ResponseCache(
         }
         if (best != null && bestSim >= similarityThreshold) {
             if (useLlmCheck && llmFunc != null) {
+                val promptTemplate =
+                    (globalConfig["similarity_check_prompt"] as? String)
+                        ?: pathrag.prompt.Prompts.SIMILARITY_CHECK
                 val promptCheck =
-                    pathrag.prompt.Prompts.SIMILARITY_CHECK
+                    promptTemplate
                         .replace("{original_prompt}", prompt)
                         .replace("{cached_prompt}", best.prompt)
                 val llmScore =
