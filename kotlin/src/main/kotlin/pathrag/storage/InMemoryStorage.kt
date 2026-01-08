@@ -100,7 +100,15 @@ class NanoVectorDBStorage(
     }
 
     override suspend fun deleteRelation(entityName: String) {
-        deleteEntity(entityName)
+        // Remove any relation vectors involving this entity (matches src_id or tgt_id in metadata)
+        mutex.withLock {
+            val toRemove =
+                entries.keys.filter { key ->
+                    val stored = entries[key]
+                    stored?.meta?.get("src_id") == entityName || stored?.meta?.get("tgt_id") == entityName
+                }
+            toRemove.forEach { entries.remove(it) }
+        }
     }
 
     private fun cosineSimilarity(

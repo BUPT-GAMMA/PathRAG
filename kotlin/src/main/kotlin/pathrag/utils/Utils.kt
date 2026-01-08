@@ -1,7 +1,6 @@
 package pathrag.utils
 
 import io.github.oshai.kotlinlogging.KotlinLogging
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.SerialName
@@ -70,17 +69,9 @@ fun limitAsyncFuncCall(
     waitingTimeMillis: Long = 1,
 ): (suspend (() -> Unit) -> suspend () -> Unit) =
     { func ->
-        val currentSize = AtomicInteger(0)
+        val semaphore = Semaphore(maxSize)
         suspend {
-            while (currentSize.get() >= maxSize) {
-                delay(waitingTimeMillis)
-            }
-            currentSize.incrementAndGet()
-            try {
-                func()
-            } finally {
-                currentSize.decrementAndGet()
-            }
+            semaphore.withPermit { func() }
         }
     }
 

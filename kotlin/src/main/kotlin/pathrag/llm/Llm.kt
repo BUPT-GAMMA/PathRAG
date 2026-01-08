@@ -141,11 +141,7 @@ suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
             }
         }
         logger.error(lastError) { "OpenAI embedding call failed after $maxAttempts attempts for model $modelName" }
-        inputs.map { text ->
-            val seed = text.hashCode()
-            val random = Random(seed)
-            DoubleArray(DEFAULT_EMBED_DIM) { random.nextDouble() }
-        }
+        throw IllegalStateException("OpenAI embedding call failed after $maxAttempts attempts for model $modelName", lastError)
     }
 }
 
