@@ -129,7 +129,7 @@ suspend fun extractEntities(
         val relationships = payload.relationships.filter { it.srcId.isNotBlank() && it.tgtId.isNotBlank() }
 
         entities.forEach { ent ->
-            val name = "\"${ent.entityName.trim('"').uppercase()}\""
+            val name = normalizeId(ent.entityName)
             val entityType = ent.entityType.ifBlank { "UNKNOWN" }
             val description = ent.description
             val nodeData =
@@ -144,8 +144,8 @@ suspend fun extractEntities(
         }
 
         relationships.forEach { rel ->
-            val src = "\"${rel.srcId.trim('"').uppercase()}\""
-            val tgt = "\"${rel.tgtId.trim('"').uppercase()}\""
+            val src = normalizeId(rel.srcId)
+            val tgt = normalizeId(rel.tgtId)
             val description = rel.description
             val keywords = rel.keywords
             val edgeData =
@@ -201,17 +201,10 @@ suspend fun extractEntities(
 
 private fun extractJsonPayload(response: String): String {
     val trimmed = response.trim()
-    if (trimmed.startsWith("```")) {
-        val withoutFence =
-            trimmed
-                .removePrefix("```json")
-                .removePrefix("```")
-        val endFenceIndex = withoutFence.lastIndexOf("```")
-        return if (endFenceIndex >= 0) {
-            withoutFence.substring(0, endFenceIndex).trim()
-        } else {
-            withoutFence.trim()
-        }
+    val fencedRegex = Regex("```(?:json)?\\s*([\\s\\S]*?)\\s*```", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+    val fencedMatch = fencedRegex.find(trimmed)
+    if (fencedMatch != null) {
+        return fencedMatch.groupValues[1].trim()
     }
     val firstBrace = trimmed.indexOf('{')
     val lastBrace = trimmed.lastIndexOf('}')
@@ -220,6 +213,8 @@ private fun extractJsonPayload(response: String): String {
     }
     return trimmed
 }
+
+private fun normalizeId(id: String): String = "\"${id.trim('"').uppercase()}\""
 
 suspend fun kgQuery(
     query: String,
@@ -245,7 +240,7 @@ suspend fun kgQuery(
         val cached = hashingKv?.getById(queryParam.mode)?.get(argsHash)
         if (cached != null) return@withContext cached
 
-        val (llKeywords, hlKeywords) = extractKeywords(llmModel, query)
+        val (llKeywords, hlKeywords) = extractKeywords(llmModel, query, globalConfig)
 
         val systemContext = "PathRAG (Kotlin) | nodes=${knowledgeGraphInst.nodes().size} | mode=${queryParam.mode}"
         val response =
@@ -637,12 +632,14 @@ private suspend fun extractKeywords(
         hashingKv: Any?,
     ) -> String,
     query: String,
+    globalConfig: Map<String, Any?>,
 ): Pair<String, String> {
+    val examples = (globalConfig["keywords_examples"] as? String).orEmpty()
     val prompt =
         Prompts.KEYWORDS_EXTRACTION.format(
             mapOf(
                 "query" to query,
-                "examples" to "",
+                "examples" to examples,
             ),
         )
     val raw = llmModel(prompt, null, emptyList(), true, false, 512, null)
