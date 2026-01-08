@@ -4,14 +4,19 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.io.File
 import java.math.BigInteger
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 private val internalLogger = KotlinLogging.logger("PathRAG")
@@ -89,9 +94,16 @@ data class CacheData(
     val mode: String = "default",
 )
 
-/**
- * Simple in-memory cache used to emulate the Python hashing KV behavior.
- */
+@Serializable
+private data class PersistEntry(
+    val content: String,
+    val prompt: String,
+    val embedding: String? = null,
+    val shape: List<Int>? = null,
+    val min: Double? = null,
+    val max: Double? = null,
+)
+
 class ResponseCache(
     val globalConfig: Map<String, Any?> = emptyMap(),
 ) {
@@ -102,6 +114,13 @@ class ResponseCache(
     )
 
     private val store = ConcurrentHashMap<String, MutableMap<String, Entry>>()
+    private val cachePath: String? =
+        (globalConfig["cache_path"] as? String)
+            ?: (globalConfig["working_dir"] as? String)?.let { "$it/llm_cache.json" }
+
+    init {
+        loadFromDisk()
+    }
 
     suspend fun getById(mode: String): Map<String, Entry>? = store[mode]
 
@@ -116,7 +135,7 @@ class ResponseCache(
                 @Suppress("UNCHECKED_CAST")
                 it as? Map<String, Any?>
             }
-                ?: mapOf("enabled" to false, "similarity_threshold" to 0.95)
+                ?: mapOf("enabled" to false, "similarity_threshold" to 0.95, "use_llm_check" to false)
         val embedEnabled = embedCfg["enabled"] as? Boolean ?: false
         val embedding =
             if (embedEnabled) {
@@ -126,6 +145,7 @@ class ResponseCache(
                 null
             }
         store.computeIfAbsent(mode) { ConcurrentHashMap() }[argsHash] = Entry(content, prompt, embedding)
+        persist()
     }
 
     suspend fun handleCache(
@@ -144,13 +164,24 @@ class ResponseCache(
                 @Suppress("UNCHECKED_CAST")
                 it as? Map<String, Any?>
             }
-                ?: mapOf("enabled" to false, "similarity_threshold" to 0.95)
+                ?: mapOf("enabled" to false, "similarity_threshold" to 0.95, "use_llm_check" to false)
         val embedEnabled = embedCfg["enabled"] as? Boolean ?: false
         if (!embedEnabled) return null
 
         val similarityThreshold = (embedCfg["similarity_threshold"] as? Number)?.toDouble() ?: 0.95
         val embeddingFunc = globalConfig["embedding_func"] as? EmbeddingFunc ?: return null
         val currentEmbedding = embeddingFunc(listOf(prompt)).firstOrNull() ?: return null
+        val useLlmCheck = embedCfg["use_llm_check"] as? Boolean ?: false
+        val llmFunc =
+            globalConfig["llm_model_func"] as? suspend (
+                String,
+                String?,
+                List<Map<String, String>>,
+                Boolean,
+                Boolean,
+                Int?,
+                Any?,
+            ) -> String
 
         var best: Entry? = null
         var bestSim = -1.0
@@ -162,7 +193,69 @@ class ResponseCache(
                 best = entry
             }
         }
-        return if (best != null && bestSim >= similarityThreshold) best.content else null
+        if (best != null && bestSim >= similarityThreshold) {
+            if (useLlmCheck && llmFunc != null) {
+                val promptCheck =
+                    pathrag.prompt.Prompts.SIMILARITY_CHECK
+                        .replace("{original_prompt}", prompt)
+                        .replace("{cached_prompt}", best.prompt)
+                val llmScore =
+                    runCatching { llmFunc(promptCheck, null, emptyList(), false, false, 32, null).trim() }
+                        .getOrNull()
+                        ?.toDoubleOrNull()
+                if (llmScore != null && llmScore < similarityThreshold) {
+                    return null
+                }
+            }
+            return best.content
+        }
+        return null
+    }
+
+    private fun persist() {
+        val path = cachePath ?: return
+        val payload =
+            store.mapValues { (_, v) ->
+                v.mapValues { (_, entry) ->
+                    val q = entry.embedding?.let { quantizeEmbedding(it) }
+                    PersistEntry(
+                        content = entry.content,
+                        prompt = entry.prompt,
+                        embedding = q?.first?.let { bytesToHex(it) },
+                        shape = q?.fourth,
+                        min = q?.second,
+                        max = q?.third,
+                    )
+                }
+            }
+        runCatching {
+            val f = File(path)
+            f.parentFile?.mkdirs()
+            f.writeText(Json.encodeToString(payload))
+        }.onFailure { internalLogger.warn(it) { "Failed to persist cache to $path" } }
+    }
+
+    private fun loadFromDisk() {
+        val path = cachePath ?: return
+        val f = File(path)
+        if (!f.exists()) return
+        runCatching {
+            val text = f.readText()
+            val decoded: Map<String, Map<String, PersistEntry>> = Json.decodeFromString(text)
+            decoded.forEach { (mode, entries) ->
+                entries.forEach { (hash, entry) ->
+                    val embedding =
+                        if (entry.embedding != null && entry.shape != null && entry.min != null && entry.max != null) {
+                            val bytes = hexToBytes(entry.embedding)
+                            dequantizeEmbedding(bytes, entry.min, entry.max, entry.shape)
+                        } else {
+                            null
+                        }
+                    store.computeIfAbsent(mode) { ConcurrentHashMap() }[hash] =
+                        Entry(entry.content, entry.prompt, embedding)
+                }
+            }
+        }.onFailure { internalLogger.warn(it) { "Failed to load cache from $path" } }
     }
 }
 
@@ -182,3 +275,59 @@ private fun cosineSimilarity(
     val denom = sqrt(na) * sqrt(nb)
     return if (denom == 0.0) -1.0 else dot / denom
 }
+
+private fun quantizeEmbedding(
+    embedding: DoubleArray,
+    bits: Int = 8,
+): Quadruple<ByteArray, Double, Double, List<Int>>? {
+    if (embedding.isEmpty()) return null
+    val min = embedding.min()
+    val max = embedding.max()
+    if (max == min) {
+        return Quadruple(ByteArray(embedding.size) { 0 }, min, max, listOf(embedding.size))
+    }
+    val scale = (max - min) / (2.0.pow(bits) - 1)
+    val bytes = ByteArray(embedding.size)
+    for (i in embedding.indices) {
+        val q = ((embedding[i] - min) / scale).toInt().coerceIn(0, 255)
+        bytes[i] = q.toByte()
+    }
+    return Quadruple(bytes, min, max, listOf(embedding.size))
+}
+
+private fun dequantizeEmbedding(
+    quantized: ByteArray,
+    min: Double,
+    max: Double,
+    shape: List<Int>,
+): DoubleArray {
+    val size = shape.firstOrNull() ?: quantized.size
+    val scale = (max - min) / 255.0
+    val result = DoubleArray(size)
+    for (i in 0 until size.coerceAtMost(quantized.size)) {
+        val v = quantized[i].toInt() and 0xFF
+        result[i] = v * scale + min
+    }
+    return result
+}
+
+private fun bytesToHex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
+
+private fun hexToBytes(hex: String): ByteArray {
+    val clean = hex.trim()
+    val len = clean.length
+    val data = ByteArray(len / 2)
+    var i = 0
+    while (i < len) {
+        data[i / 2] = ((Character.digit(clean[i], 16) shl 4) + Character.digit(clean[i + 1], 16)).toByte()
+        i += 2
+    }
+    return data
+}
+
+private data class Quadruple<A, B, C, D>(
+    val first: A,
+    val second: B,
+    val third: C,
+    val fourth: D,
+)

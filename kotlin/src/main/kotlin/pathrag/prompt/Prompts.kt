@@ -30,9 +30,20 @@ Use {language}.
 {query}
 ---Examples---
 {examples}
----Output Format---
-{ "high_level_keywords": [...], "low_level_keywords": [...] }
-Only return JSON.
+    ---Output Format---
+    { "high_level_keywords": [...], "low_level_keywords": [...] }
+    Only return JSON.
+    """
+
+    const val SIMILARITY_CHECK = """Please analyze the similarity between these two questions:
+
+Question 1: {original_prompt}
+Question 2: {cached_prompt}
+
+Please provide a similarity score between 0 and 1 directly:
+1. Whether these two questions are semantically similar
+2. Whether the answer to Question 2 can be used to answer Question 1
+Return only a number between 0-1, no extra text.
 """
 
     const val ENTITY_REL_JSON = """
