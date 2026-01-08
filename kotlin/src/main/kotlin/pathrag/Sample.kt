@@ -18,6 +18,9 @@ fun main() =
                 chunkOverlapTokenSize = 120,
                 language = "English",
                 keywordExamples = "",
+                // Optional: pin keywords instead of calling the LLM extractor
+                highLevelKeywords = listOf("themes", "Dickens"),
+                lowLevelKeywords = listOf("poverty", "class struggle", "redemption"),
                 similarityCheckPrompt = pathrag.prompt.Prompts.SIMILARITY_CHECK,
                 embeddingCacheConfig =
                     mapOf(
@@ -28,7 +31,7 @@ fun main() =
                 addonParams =
                     mapOf(
                         "entity_types" to listOf("organization", "person", "geo", "event", "category"),
-                        "language" to "English",
+                        // language is set at top-level already
                         "example_number" to 3,
                     ),
             )
@@ -40,6 +43,14 @@ fun main() =
                 Charles Dickens was an English writer and social critic.
                 He created some of the world's best-known fictional characters
                 and is regarded as one of the greatest novelists of the Victorian era.
+                """.trimIndent(),
+                """
+                Oliver Twist is a novel by Dickens that critiques workhouses and child poverty.
+                It follows an orphan navigating criminal underworlds and harsh social systems.
+                """.trimIndent(),
+                """
+                A Christmas Carol tells the redemption story of Ebenezer Scrooge, shifting from greed to generosity.
+                It explores themes of morality, compassion, and social responsibility.
                 """.trimIndent(),
             ),
         )

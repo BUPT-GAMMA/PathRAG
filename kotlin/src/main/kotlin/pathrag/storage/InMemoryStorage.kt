@@ -47,7 +47,7 @@ class NanoVectorDBStorage(
     override val namespace: String,
     override val globalConfig: Map<String, Any?>,
     private val embeddingFunc: EmbeddingFunc,
-    private val metaFields: Set<String> = emptySet(),
+    private val metaFields: Set<String> = setOf("entity_name", "full_doc_id", "source_id"),
 ) : BaseVectorStorage(namespace, globalConfig) {
     private val mutex = Mutex()
     private val entries = ConcurrentHashMap<String, StoredVector>()
@@ -63,7 +63,10 @@ class NanoVectorDBStorage(
         topK: Int,
     ): List<Map<String, Any?>> {
         if (entries.isEmpty()) return emptyList()
-        val queryEmbedding = embeddingFunc(listOf(query)).first()
+        if (query.isBlank()) return emptyList()
+        val queryEmbeddings = embeddingFunc(listOf(query))
+        if (queryEmbeddings.isEmpty()) return emptyList()
+        val queryEmbedding = queryEmbeddings.first()
         return entries.values
             .map { stored ->
                 val similarity = cosineSimilarity(queryEmbedding, stored.embedding)
@@ -73,14 +76,17 @@ class NanoVectorDBStorage(
     }
 
     override suspend fun upsert(data: Map<String, Map<String, Any?>>) {
-        val embeddings = embeddingFunc(data.values.map { it["content"].toString() })
         val items = data.entries.toList()
+        val contents = items.map { it.value["content"]?.toString().orEmpty() }
+        val validPairs = items.zip(contents).filter { it.second.isNotBlank() }
+        if (validPairs.isEmpty()) return
+        val embeddings = embeddingFunc(validPairs.map { it.second })
         mutex.withLock {
             embeddings.forEachIndexed { index, vector ->
-                val key = items[index].key
-                val value = items[index].value
+                val (entry, content) = validPairs[index]
+                val key = entry.key
+                val value = entry.value
                 val meta = value.filterKeys { metaFields.contains(it) }
-                val content = value["content"]?.toString().orEmpty()
                 entries[key] = StoredVector(vector, content, meta)
             }
         }
@@ -116,6 +122,7 @@ class NetworkXStorage(
     private val mutex = Mutex()
     private val nodes = ConcurrentHashMap<String, MutableMap<String, Any?>>()
     private val edges = ConcurrentHashMap<Pair<String, String>, MutableMap<String, Any?>>()
+    private var cachedPagerank: Map<String, Double>? = null
 
     override suspend fun hasNode(nodeId: String): Boolean = nodes.containsKey(nodeId)
 
@@ -146,6 +153,7 @@ class NetworkXStorage(
         nodeData: Map<String, Any?>,
     ) {
         mutex.withLock {
+            cachedPagerank = null
             val existing = nodes[nodeId] ?: mutableMapOf()
             existing.putAll(nodeData)
             nodes[nodeId] = existing
@@ -158,6 +166,7 @@ class NetworkXStorage(
         edgeData: Map<String, Any?>,
     ) {
         mutex.withLock {
+            cachedPagerank = null
             val existing = edges[sourceNodeId to targetNodeId] ?: mutableMapOf()
             existing.putAll(edgeData)
             edges[sourceNodeId to targetNodeId] = existing
@@ -168,6 +177,7 @@ class NetworkXStorage(
         mutex.withLock {
             nodes.remove(nodeId)
             edges.keys.filter { it.first == nodeId || it.second == nodeId }.forEach { edges.remove(it) }
+            cachedPagerank = null
         }
     }
 
@@ -176,7 +186,7 @@ class NetworkXStorage(
     override suspend fun edges(): List<Pair<String, String>> = edges.keys.toList()
 
     override suspend fun getPagerank(nodeId: String): Double {
-        val ranks = computePagerank()
+        val ranks = cachedPagerank ?: computePagerank().also { cachedPagerank = it }
         return ranks[nodeId] ?: 0.0
     }
 
@@ -238,6 +248,13 @@ class NetworkXStorage(
         val nodesList = nodes.keys().toList()
         if (nodesList.isEmpty()) return emptyMap()
         val n = nodesList.size
+        val adjacency =
+            nodesList.associateWith { mutableListOf<String>() }.toMutableMap().also { adj ->
+                edges.keys.forEach { (u, v) ->
+                    adj[u]?.add(v)
+                    adj[v]?.add(u)
+                }
+            }
         val rank = mutableMapOf<String, Double>()
         nodesList.forEach { rank[it] = 1.0 / n }
 
@@ -245,13 +262,10 @@ class NetworkXStorage(
             var diff = 0.0
             val newRank = mutableMapOf<String, Double>()
             for (node in nodesList) {
-                val neighbors = edges.keys.filter { it.first == node || it.second == node }
+                val neighbors = adjacency[node].orEmpty()
                 val outDeg = neighbors.size
                 val share = if (outDeg == 0) 0.0 else rank[node]!! / outDeg
-                neighbors.forEach { (u, v) ->
-                    val dest = if (u == node) v else u
-                    newRank[dest] = (newRank[dest] ?: 0.0) + share
-                }
+                neighbors.forEach { dest -> newRank[dest] = (newRank[dest] ?: 0.0) + share }
             }
             for (node in nodesList) {
                 val updated = (1 - damping) / n + damping * (newRank[node] ?: 0.0)

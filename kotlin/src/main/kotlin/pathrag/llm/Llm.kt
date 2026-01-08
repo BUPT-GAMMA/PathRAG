@@ -89,7 +89,7 @@ suspend fun openAiComplete(
                     lastError = e
                     logger.warn(e) { "OpenAI chat attempt ${attempt + 1} failed for model $modelName" }
                     if (attempt < maxAttempts - 1) {
-                        Thread.sleep(backoffMs)
+                        delay(backoffMs)
                     }
                 }
             }
@@ -101,9 +101,11 @@ suspend fun openAiComplete(
 
 suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
     val apiKey = System.getenv("OPENAI_API_KEY")
+    val sanitized = inputs.filter { it.isNotBlank() }
+    if (sanitized.isEmpty()) return emptyList()
     if (apiKey.isNullOrBlank()) {
         logger.warn { "OPENAI_API_KEY not set. Falling back to stubbed embeddings." }
-        return inputs.map { text ->
+        return sanitized.map { text ->
             val seed = text.hashCode()
             val random = Random(seed)
             DoubleArray(1536) { random.nextDouble() }
@@ -124,7 +126,7 @@ suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
         var lastError: Exception? = null
         repeat(maxAttempts) { attempt ->
             try {
-                val segments = inputs.map { TextSegment.from(it) }
+                val segments = sanitized.map { TextSegment.from(it) }
                 val response: Response<List<Embedding>> = embedModel.embedAll(segments)
                 return@withContext response.content().map { embedding ->
                     val vector = embedding.vector()
@@ -134,7 +136,7 @@ suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
                 lastError = e
                 logger.warn(e) { "OpenAI embedding attempt ${attempt + 1} failed for model $modelName" }
                 if (attempt < maxAttempts - 1) {
-                    Thread.sleep(backoffMs)
+                    delay(backoffMs)
                 }
             }
         }

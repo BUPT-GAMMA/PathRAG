@@ -36,11 +36,25 @@ class PathRAG(
             "similarity_threshold" to (System.getenv("EMBEDDING_CACHE_SIM_THRESHOLD")?.toDoubleOrNull() ?: 0.95),
             "use_llm_check" to (System.getenv("EMBEDDING_CACHE_USE_LLM_CHECK")?.toBoolean() ?: false),
         ),
+    private val highLevelKeywords: List<String> =
+        System
+            .getenv("HIGH_LEVEL_KEYWORDS")
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?: emptyList(),
+    private val lowLevelKeywords: List<String> =
+        System
+            .getenv("LOW_LEVEL_KEYWORDS")
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?: emptyList(),
     private val addonParams: Map<String, Any?> =
         mapOf(
             "entity_types" to (System.getenv("ENTITY_TYPES")?.split(",")?.map { it.trim() } ?: emptyList<String>()),
-            "language" to (System.getenv("LANGUAGE") ?: "English"),
-            "example_number" to (System.getenv("KEYWORD_EXAMPLE_COUNT")?.toIntOrNull()),
+            "language" to language, // follow top-level language
+            "example_number" to (System.getenv("KEYWORD_EXAMPLE_COUNT")?.toIntOrNull() ?: 3),
         ),
 ) {
     private val logger = KotlinLogging.logger("PathRAG")
@@ -101,6 +115,8 @@ class PathRAG(
             "addon_params" to addonParams,
             "llm_model_name" to llmModelName,
             "similarity_check_prompt" to similarityCheckPrompt,
+            "fixed_high_level_keywords" to highLevelKeywords,
+            "fixed_low_level_keywords" to lowLevelKeywords,
         )
 
     fun insert(stringOrStrings: Any) = runBlockingMaybe { ainsert(stringOrStrings) }

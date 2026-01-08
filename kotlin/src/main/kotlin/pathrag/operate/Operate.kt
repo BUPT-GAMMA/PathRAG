@@ -173,6 +173,7 @@ suspend fun extractEntities(
                         mapOf(
                             "content" to (ent["description"] ?: ""),
                             "entity_name" to entityName,
+                            "source_id" to (ent["source_id"] ?: ""),
                         )
                 }.toMap()
         runCatching { entityVdb.upsert(toStore) }
@@ -195,6 +196,7 @@ suspend fun extractEntities(
                             "content" to (description + keywords),
                             "keywords" to keywords,
                             "description" to description,
+                            "source_id" to (edge["source_id"]?.toString() ?: ""),
                         )
                 }.toMap()
         runCatching { relationshipsVdb.upsert(toStore) }
@@ -406,7 +408,7 @@ private suspend fun getNodeData(
         }
 
     val textUnits = findMostRelatedTextUnitFromEntities(nodeDatas, queryParam, textChunksDb)
-    val relations = buildPathRelations(nodeDatas, knowledgeGraphInst, queryParam)
+    val relations = buildPathRelations(nodeDatas, knowledgeGraphInst, queryParam) // Explore paths between entities
 
     val entitiesCsv =
         toCsv(
@@ -471,7 +473,8 @@ private suspend fun buildPathRelations(
     if (paths.isEmpty()) return emptyList()
 
     val nodesCache = mutableMapOf<String, Map<String, Any?>>()
-    for (name in targetNodes) {
+    val allPathNodes = selectedPaths.flatten().toSet()
+    for (name in allPathNodes) {
         nodesCache[name] = knowledgeGraphInst.getNode(name) ?: emptyMap()
     }
 
@@ -786,6 +789,20 @@ private suspend fun extractKeywords(
     query: String,
     globalConfig: Map<String, Any?>,
 ): Pair<String, String> {
+    val configuredHigh =
+        (globalConfig["fixed_high_level_keywords"] as? Collection<*>)
+            ?.mapNotNull { it?.toString()?.takeIf { s -> s.isNotBlank() } }
+            ?: emptyList()
+    val configuredLow =
+        (globalConfig["fixed_low_level_keywords"] as? Collection<*>)
+            ?.mapNotNull { it?.toString()?.takeIf { s -> s.isNotBlank() } }
+            ?: emptyList()
+    if (configuredHigh.isNotEmpty() || configuredLow.isNotEmpty()) {
+        val hl = configuredHigh.joinToString(", ")
+        val ll = configuredLow.joinToString(", ")
+        return ll to hl
+    }
+
     val examples = (globalConfig["keywords_examples"] as? String).orEmpty()
     val language = (globalConfig["language"] as? String) ?: Prompts.DEFAULT_LANGUAGE
     val prompt =

@@ -188,7 +188,7 @@ class ResponseCache(
         modeCache?.values?.forEach { entry ->
             val cachedEmb = entry.embedding ?: return@forEach
             val sim = cosineSimilarity(currentEmbedding, cachedEmb)
-            if (sim > bestSim) {
+            if (!sim.isNaN() && sim > bestSim) {
                 bestSim = sim
                 best = entry
             }
@@ -266,7 +266,7 @@ private fun cosineSimilarity(
     a: DoubleArray,
     b: DoubleArray,
 ): Double {
-    if (a.isEmpty() || b.isEmpty() || a.size != b.size) return -1.0
+    if (a.isEmpty() || b.isEmpty() || a.size != b.size) return Double.NaN
     var dot = 0.0
     var na = 0.0
     var nb = 0.0
@@ -276,7 +276,7 @@ private fun cosineSimilarity(
         nb += b[i] * b[i]
     }
     val denom = sqrt(na) * sqrt(nb)
-    return if (denom == 0.0) -1.0 else dot / denom
+    return if (denom == 0.0) Double.NaN else dot / denom
 }
 
 private fun quantizeEmbedding(
@@ -284,15 +284,18 @@ private fun quantizeEmbedding(
     bits: Int = 8,
 ): Quadruple<ByteArray, Double, Double, List<Int>>? {
     if (embedding.isEmpty()) return null
+    // Only 8-bit quantization is supported because we store values in a ByteArray and dequantize with 255-scale.
+    require(bits == 8) { "Only 8-bit quantization is supported." }
     val min = embedding.min()
     val max = embedding.max()
+    val maxVal = (1 shl bits) - 1
     if (max == min) {
         return Quadruple(ByteArray(embedding.size) { 0 }, min, max, listOf(embedding.size))
     }
-    val scale = (max - min) / (2.0.pow(bits) - 1)
+    val scale = (max - min) / maxVal
     val bytes = ByteArray(embedding.size)
     for (i in embedding.indices) {
-        val q = ((embedding[i] - min) / scale).toInt().coerceIn(0, 255)
+        val q = ((embedding[i] - min) / scale).toInt().coerceIn(0, maxVal)
         bytes[i] = q.toByte()
     }
     return Quadruple(bytes, min, max, listOf(embedding.size))
@@ -318,11 +321,15 @@ private fun bytesToHex(bytes: ByteArray): String = bytes.joinToString("") { "%02
 
 private fun hexToBytes(hex: String): ByteArray {
     val clean = hex.trim()
+    require(clean.length % 2 == 0) { "Hex string must have an even length." }
     val len = clean.length
     val data = ByteArray(len / 2)
     var i = 0
     while (i < len) {
-        data[i / 2] = ((Character.digit(clean[i], 16) shl 4) + Character.digit(clean[i + 1], 16)).toByte()
+        val high = Character.digit(clean[i], 16)
+        val low = Character.digit(clean[i + 1], 16)
+        require(high >= 0 && low >= 0) { "Invalid hex character at position $i" }
+        data[i / 2] = ((high shl 4) + low).toByte()
         i += 2
     }
     return data
