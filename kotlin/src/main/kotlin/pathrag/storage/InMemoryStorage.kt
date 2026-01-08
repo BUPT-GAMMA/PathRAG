@@ -86,8 +86,9 @@ class NanoVectorDBStorage(
     }
 
     override suspend fun deleteEntity(entityName: String) {
+        val entityId = computeMdHashId(entityName, prefix = "ent-")
         mutex.withLock {
-            entries.keys.filter { it.contains(entityName, ignoreCase = true) }.forEach { entries.remove(it) }
+            entries.remove(entityId)
         }
     }
 

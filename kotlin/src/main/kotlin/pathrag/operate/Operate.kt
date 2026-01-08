@@ -426,12 +426,14 @@ private suspend fun runHybridMode(
 private fun truncateByToken(
     list: List<Map<String, Any>>,
     maxToken: Int,
+    model: String = "gpt-4o-mini",
 ): List<Map<String, Any>> {
     var count = 0
     val result = mutableListOf<Map<String, Any>>()
     for (item in list) {
         val content = item["content"]?.toString() ?: ""
-        count += content.length
+        val tokens = Tokenizer.encode(content, model).size
+        count += tokens
         if (count > maxToken) break
         result.add(item)
     }

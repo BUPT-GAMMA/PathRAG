@@ -11,8 +11,6 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.cors.routing.CORS
-import io.ktor.server.plugins.cors.routing.allowHost
-import io.ktor.server.plugins.cors.routing.anyHost
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
@@ -53,14 +51,15 @@ fun Application.module(env: EnvironmentConfig = EnvironmentConfig.empty()) {
     install(CORS) {
         val origins = env.corsOrigins()
         if (origins == "*") {
-            anyHost()
+            allowOrigins { true }
             logger.warn { "CORS is configured to allow all origins. Avoid this configuration in production." }
         } else {
-            origins
-                .split(",")
-                .map { it.trim() }
-                .filter { it.isNotBlank() }
-                .forEach { allowHost(it, listOf("http", "https")) }
+            val allowed =
+                origins
+                    .split(",")
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+            allowOrigins { origin -> allowed.any { origin.contains(it, ignoreCase = true) } }
         }
         allowCredentials = true
         allowMethod(HttpMethod.Get)

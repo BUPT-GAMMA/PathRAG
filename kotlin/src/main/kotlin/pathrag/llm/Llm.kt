@@ -80,7 +80,7 @@ suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
         return inputs.map { text ->
             val seed = text.hashCode()
             val random = Random(seed)
-            DoubleArray(16) { random.nextDouble() }
+            DoubleArray(1536) { random.nextDouble() }
         }
     }
     val baseUrl = System.getenv("OPENAI_API_BASE")

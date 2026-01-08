@@ -48,40 +48,34 @@ class PathRAG(
 
     private val llmResponseCache = ResponseCache()
 
-    private val storageFactory: Map<String, () -> BaseKVStorage<Map<String, Any>>> =
-        mapOf(
-            "JsonKVStorage" to { JsonKVStorage("kv", globalConfig(), embeddingFunc) },
-        )
-    private val vectorFactory: Map<String, () -> BaseVectorStorage> =
-        mapOf(
-            "NanoVectorDBStorage" to { NanoVectorDBStorage("vdb", globalConfig(), embeddingFunc) },
-        )
-    private val graphFactory: Map<String, () -> BaseGraphStorage> =
-        mapOf(
-            "NetworkXStorage" to { NetworkXStorage("graph", globalConfig(), embeddingFunc) },
-        )
+    private fun createKvStorage(namespace: String): BaseKVStorage<Map<String, Any>> =
+        when (kvStorage) {
+            "JsonKVStorage" -> JsonKVStorage(namespace, globalConfig(), embeddingFunc)
+            else -> error("Unknown kv storage: $kvStorage")
+        }
 
-    private val fullDocs: BaseKVStorage<Map<String, Any>> =
-        storageFactory[kvStorage]?.invoke()
-            ?: error("Unknown kv storage: $kvStorage")
-    private val textChunks: BaseKVStorage<Map<String, Any>> =
-        storageFactory[kvStorage]?.invoke()
-            ?: error("Unknown kv storage: $kvStorage")
-    private var chunkEntityRelationGraph: BaseGraphStorage =
-        graphFactory[graphStorage]?.invoke()
-            ?: error("Unknown graph storage: $graphStorage")
-    private val entitiesVdb: BaseVectorStorage =
-        vectorFactory[vectorStorage]?.invoke()
-            ?: error("Unknown vector storage: $vectorStorage")
-    private val relationshipsVdb: BaseVectorStorage =
-        vectorFactory[vectorStorage]?.invoke()
-            ?: error("Unknown vector storage: $vectorStorage")
-    private val chunksVdb: BaseVectorStorage =
-        vectorFactory[vectorStorage]?.invoke()
-            ?: error("Unknown vector storage: $vectorStorage")
+    private fun createVectorStorage(namespace: String): BaseVectorStorage =
+        when (vectorStorage) {
+            "NanoVectorDBStorage" -> NanoVectorDBStorage(namespace, globalConfig(), embeddingFunc)
+            else -> error("Unknown vector storage: $vectorStorage")
+        }
+
+    private fun createGraphStorage(namespace: String): BaseGraphStorage =
+        when (graphStorage) {
+            "NetworkXStorage" -> NetworkXStorage(namespace, globalConfig(), embeddingFunc)
+            else -> error("Unknown graph storage: $graphStorage")
+        }
+
+    private val fullDocs: BaseKVStorage<Map<String, Any>> = createKvStorage("full_docs")
+    private val textChunks: BaseKVStorage<Map<String, Any>> = createKvStorage("text_chunks")
+    private var chunkEntityRelationGraph: BaseGraphStorage = createGraphStorage("chunk_entity_relation")
+    private val entitiesVdb: BaseVectorStorage = createVectorStorage("entities_vdb")
+    private val relationshipsVdb: BaseVectorStorage = createVectorStorage("relationships_vdb")
+    private val chunksVdb: BaseVectorStorage = createVectorStorage("chunks_vdb")
 
     private fun globalConfig(): Map<String, Any?> =
         mapOf(
+            "working_dir" to workingDir,
             "embedding_func" to embeddingFunc,
             "llm_model_func" to llmModelFunc,
             "chunk_token_size" to chunkTokenSize,

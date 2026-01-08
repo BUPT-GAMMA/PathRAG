@@ -11,6 +11,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import java.math.BigInteger
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 private val internalLogger = KotlinLogging.logger("PathRAG")
 
@@ -63,16 +64,16 @@ fun limitAsyncFuncCall(
     waitingTimeMillis: Long = 1,
 ): (suspend (() -> Unit) -> suspend () -> Unit) =
     { func ->
-        var currentSize = 0
+        val currentSize = AtomicInteger(0)
         suspend {
-            while (currentSize >= maxSize) {
+            while (currentSize.get() >= maxSize) {
                 delay(waitingTimeMillis)
             }
-            currentSize += 1
+            currentSize.incrementAndGet()
             try {
                 func()
             } finally {
-                currentSize -= 1
+                currentSize.decrementAndGet()
             }
         }
     }

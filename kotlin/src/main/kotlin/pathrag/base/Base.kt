@@ -88,9 +88,9 @@ abstract class BaseGraphStorage(
 
     abstract suspend fun getNodeEdges(sourceNodeId: String): List<Pair<String, String>>?
 
-    open suspend fun getNodeInEdges(sourceNodeId: String): List<Pair<String, String>>? = getNodeEdges(sourceNodeId)
+    open suspend fun getNodeInEdges(nodeId: String): List<Pair<String, String>>? = edges().filter { it.second == nodeId }
 
-    open suspend fun getNodeOutEdges(sourceNodeId: String): List<Pair<String, String>>? = getNodeEdges(sourceNodeId)
+    open suspend fun getNodeOutEdges(nodeId: String): List<Pair<String, String>>? = edges().filter { it.first == nodeId }
 
     abstract suspend fun upsertNode(
         nodeId: String,
