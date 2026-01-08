@@ -3,6 +3,12 @@ package pathrag.operate
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import pathrag.base.BaseGraphStorage
 import pathrag.base.BaseKVStorage
 import pathrag.base.BaseVectorStorage
@@ -12,10 +18,19 @@ import pathrag.utils.ResponseCache
 import pathrag.utils.Tokenizer
 import pathrag.utils.computeArgsHash
 import pathrag.utils.computeMdHashId
-import kotlin.math.max
 import kotlin.math.min
 
 private val logger = KotlinLogging.logger("PathRAG-Operate")
+private typealias LlmFunc =
+    suspend (
+        prompt: String,
+        systemPrompt: String?,
+        historyMessages: List<Map<String, String>>,
+        keywordExtraction: Boolean,
+        stream: Boolean,
+        maxTokens: Int?,
+        hashingKv: Any?,
+    ) -> String
 
 fun chunkingByTokenSize(
     content: String,
@@ -23,6 +38,9 @@ fun chunkingByTokenSize(
     maxTokenSize: Int = 1024,
     tiktokenModel: String = "gpt-4o-mini",
 ): List<Map<String, Any>> {
+    require(maxTokenSize > overlapTokenSize) {
+        "maxTokenSize ($maxTokenSize) must be greater than overlapTokenSize ($overlapTokenSize)"
+    }
     val tokens = Tokenizer.encode(content, tiktokenModel)
     val chunks = mutableListOf<Map<String, Any>>()
     var index = 0
@@ -45,8 +63,9 @@ fun chunkingByTokenSize(
 }
 
 /**
- * Lightweight placeholder that simply returns the existing graph storage.
- * Replace with a full entity/relationship extraction when an LLM backend is available.
+ * Basic entity/relationship extraction that mirrors the Python flow shape:
+ * - Uses LLM to parse entities/relationships from text chunks
+ * - Merges entities by name, ensures graph + VDB consistency
  */
 suspend fun extractEntities(
     chunks: Map<String, Map<String, Any>>,
@@ -55,8 +74,121 @@ suspend fun extractEntities(
     relationshipsVdb: BaseVectorStorage,
     globalConfig: Map<String, Any?>,
 ): BaseGraphStorage {
-    logger.info { "Stub entity extraction for ${chunks.size} chunks (no-op)." }
+    logger.info { "Extracting entities for ${chunks.size} chunks via LLM." }
+
+    @Suppress("UNCHECKED_CAST")
+    val llm = globalConfig["llm_model_func"] as? LlmFunc ?: return knowledgeGraphInst
+
+    val allEntities = mutableListOf<Map<String, String>>()
+    val allRelationships = mutableListOf<Map<String, Any>>()
+
+    for ((chunkId, chunk) in chunks) {
+        val content = chunk["content"]?.toString().orEmpty()
+        if (content.isBlank()) continue
+        val prompt = Prompts.ENTITY_REL_JSON.replace("{text}", content)
+        val response = llm(prompt, null, emptyList(), false, false, 2048, null)
+        val parsed = Json.parseToJsonElement(extractJsonPayload(response)).jsonObject
+        val entities: List<Map<String, String>> =
+            (parsed["entities"] as? JsonArray)
+                ?.mapNotNull { it as? JsonObject }
+                ?.map { element -> element.mapValues { entry -> entry.value.jsonPrimitive.content } }
+                .orEmpty()
+        val relationships: List<Map<String, String>> =
+            (parsed["relationships"] as? JsonArray)
+                ?.mapNotNull { it as? JsonObject }
+                ?.map { element -> element.mapValues { entry -> entry.value.jsonPrimitive.content } }
+                .orEmpty()
+
+        entities.forEach { ent ->
+            val nameRaw = ent["entity_name"] ?: return@forEach
+            val name = "\"${nameRaw.uppercase()}\""
+            val entityType = ent["entity_type"] ?: "UNKNOWN"
+            val description = ent["description"] ?: ""
+            val nodeData =
+                mapOf(
+                    "entity_type" to entityType,
+                    "description" to description,
+                    "source_id" to chunkId,
+                    "entity_name" to name,
+                )
+            allEntities.add(nodeData)
+            knowledgeGraphInst.upsertNode(name, nodeData)
+        }
+
+        relationships.forEach { rel ->
+            val srcRaw = rel["src_id"] ?: return@forEach
+            val tgtRaw = rel["tgt_id"] ?: return@forEach
+            val src = "\"${srcRaw.uppercase()}\""
+            val tgt = "\"${tgtRaw.uppercase()}\""
+            val description = rel["description"] ?: ""
+            val keywords = rel["keywords"] ?: ""
+            val edgeData =
+                mapOf(
+                    "weight" to (rel["weight"]?.toDoubleOrNull() ?: 1.0),
+                    "description" to description,
+                    "keywords" to keywords,
+                    "source_id" to chunkId,
+                )
+            allRelationships.add(mapOf("src_id" to src, "tgt_id" to tgt) + edgeData)
+            knowledgeGraphInst.upsertEdge(src, tgt, edgeData)
+        }
+    }
+
+    if (allEntities.isNotEmpty()) {
+        val toStore =
+            allEntities
+                .mapNotNull { ent ->
+                    val entityName = ent["entity_name"] ?: return@mapNotNull null
+                    val id = computeMdHashId(entityName, prefix = "ent-")
+                    id to
+                        mapOf(
+                            "content" to (ent["description"] ?: ""),
+                            "entity_name" to entityName,
+                        )
+                }.toMap()
+        entityVdb.upsert(toStore)
+    }
+
+    if (allRelationships.isNotEmpty()) {
+        val toStore =
+            allRelationships
+                .mapNotNull { edge ->
+                    val src = edge["src_id"]?.toString() ?: return@mapNotNull null
+                    val tgt = edge["tgt_id"]?.toString() ?: return@mapNotNull null
+                    val description = edge["description"]?.toString() ?: ""
+                    val keywords = edge["keywords"]?.toString() ?: ""
+                    val id = computeMdHashId(src + tgt, prefix = "rel-")
+                    id to
+                        mapOf(
+                            "src_id" to src,
+                            "tgt_id" to tgt,
+                            "content" to (description + keywords),
+                            "keywords" to keywords,
+                            "description" to description,
+                        )
+                }.toMap()
+        relationshipsVdb.upsert(toStore)
+    }
+
     return knowledgeGraphInst
+}
+
+private fun extractJsonPayload(response: String): String {
+    val trimmed = response.trim()
+    if (trimmed.startsWith("```")) {
+        val withoutFence =
+            trimmed
+                .removePrefix("```json")
+                .removePrefix("```")
+        val endFenceIndex = withoutFence.lastIndexOf("```")
+        return if (endFenceIndex >= 0) {
+            withoutFence.substring(0, endFenceIndex).trim()
+        } else {
+            withoutFence.trim()
+        }
+    }
+    val match = Regex("\\{.*}\\s*$", RegexOption.DOT_MATCHES_ALL).find(trimmed)
+    return match?.value?.trim() ?: trimmed
 }
 
 suspend fun kgQuery(
@@ -83,13 +215,14 @@ suspend fun kgQuery(
         val cached = hashingKv?.getById(queryParam.mode)?.get(argsHash)
         if (cached != null) return@withContext cached
 
-        val systemContext =
-            "PathRAG (Kotlin) | nodes=${knowledgeGraphInst.nodes().size} | mode=${queryParam.mode}"
+        val (llKeywords, hlKeywords) = extractKeywords(llmModel, query)
+
+        val systemContext = "PathRAG (Kotlin) | nodes=${knowledgeGraphInst.nodes().size} | mode=${queryParam.mode}"
         val response =
             when (queryParam.mode.lowercase()) {
                 "local" -> {
                     runLocalMode(
-                        query,
+                        llKeywords,
                         queryParam,
                         entitiesVdb,
                         knowledgeGraphInst,
@@ -101,7 +234,7 @@ suspend fun kgQuery(
 
                 "global" -> {
                     runGlobalMode(
-                        query,
+                        hlKeywords,
                         queryParam,
                         knowledgeGraphInst,
                         relationshipsVdb,
@@ -113,6 +246,8 @@ suspend fun kgQuery(
 
                 "hybrid" -> {
                     runHybridMode(
+                        llKeywords,
+                        hlKeywords,
                         query,
                         queryParam,
                         knowledgeGraphInst,
@@ -150,10 +285,9 @@ private suspend fun runLocalMode(
     ) -> String,
     systemContext: String,
 ): String {
-    val keywords = query
     val (entitiesCsv, relationsCsv, textCsv) =
         getNodeData(
-            keywords,
+            query,
             knowledgeGraphInst,
             entitiesVdb,
             textChunksDb,
@@ -349,7 +483,9 @@ private suspend fun runGlobalMode(
 }
 
 private suspend fun runHybridMode(
-    query: String,
+    llKeywords: String,
+    hlKeywords: String,
+    userQuery: String,
     queryParam: QueryParam,
     knowledgeGraphInst: BaseGraphStorage,
     entitiesVdb: BaseVectorStorage,
@@ -368,9 +504,9 @@ private suspend fun runHybridMode(
     hashingKv: ResponseCache?,
 ): String {
     val (hlEntities, hlRelations, hlText) =
-        getEdgeData(query, knowledgeGraphInst, relationshipsVdb, textChunksDb, queryParam)
+        getEdgeData(hlKeywords, knowledgeGraphInst, relationshipsVdb, textChunksDb, queryParam)
     val (llEntities, llRelations, llText) =
-        getNodeData(query, knowledgeGraphInst, entitiesVdb, textChunksDb, queryParam)
+        getNodeData(llKeywords, knowledgeGraphInst, entitiesVdb, textChunksDb, queryParam)
 
     val mergedContext =
         """
@@ -413,7 +549,7 @@ private suspend fun runHybridMode(
         )
 
     return llmModel(
-        query,
+        userQuery,
         "$systemContext\n$sysPrompt",
         emptyList(),
         false,
@@ -445,10 +581,49 @@ private fun toCsv(
     rows: List<List<String>>,
 ): String {
     val allRows = listOf(headers) + rows
-    return allRows.joinToString("\n") { it.joinToString(",") }
+    return allRows.joinToString("\n") { row -> row.joinToString(",") { escapeCsvField(it) } }
 }
 
 private fun emptyCsv(headers: List<String>): String = headers.joinToString(",")
+
+private fun escapeCsvField(value: String): String {
+    val needsQuotes = value.contains(',') || value.contains('\n') || value.contains('"')
+    if (!needsQuotes) return value
+    val escaped = value.replace("\"", "\"\"")
+    return "\"$escaped\""
+}
+
+private suspend fun extractKeywords(
+    llmModel: suspend (
+        prompt: String,
+        systemPrompt: String?,
+        historyMessages: List<Map<String, String>>,
+        keywordExtraction: Boolean,
+        stream: Boolean,
+        maxTokens: Int?,
+        hashingKv: Any?,
+    ) -> String,
+    query: String,
+): Pair<String, String> {
+    val prompt =
+        Prompts.KEYWORDS_EXTRACTION.format(
+            mapOf(
+                "query" to query,
+                "examples" to "",
+            ),
+        )
+    val raw = llmModel(prompt, null, emptyList(), true, false, 512, null)
+    val parsed = Json.parseToJsonElement(extractJsonPayload(raw)).jsonObject
+    val hl =
+        (parsed["high_level_keywords"] as? JsonArray)
+            ?.joinToString(", ") { it.jsonPrimitive.content }
+            ?: ""
+    val ll =
+        (parsed["low_level_keywords"] as? JsonArray)
+            ?.joinToString(", ") { it.jsonPrimitive.content }
+            ?: ""
+    return ll to hl
+}
 
 private suspend fun getEdgeData(
     keywords: String,

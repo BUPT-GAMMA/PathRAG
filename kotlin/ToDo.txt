@@ -1,5 +1,4 @@
-  - Entity/relationship extraction: Python runs extract_entities with LLM prompts, merging nodes/edges, summarizing
-    descriptions, node2vec, etc. Kotlin has only a no‑op extractEntities, so inserts never build a real graph.
+  Done: - Entity/relationship extraction: Python runs extract_entities with LLM prompts, merging nodes/edges, summarizing descriptions, node2vec, etc. Kotlin has only a no‑op extractEntities, so inserts never build a real graph.
   Done: - Chunking/tokenization parity: Python uses tiktoken for token-accurate chunk sizes; Kotlin uses naive string chunking, so chunk boundaries and token budgets differ.
   - Query modes logic:
       - Python hybrid builds keyword prompts via LLM, runs vector queries for entities/relations, computes path-based
