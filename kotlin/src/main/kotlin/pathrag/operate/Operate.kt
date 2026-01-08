@@ -3,6 +3,9 @@ package pathrag.operate
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -31,6 +34,36 @@ private typealias LlmFunc =
         maxTokens: Int?,
         hashingKv: Any?,
     ) -> String
+
+@Serializable
+private data class LlmEntity(
+    @SerialName("entity_name") val entityName: String = "",
+    @SerialName("entity_type") val entityType: String = "UNKNOWN",
+    val description: String = "",
+    @SerialName("source_id") val sourceId: String? = null,
+)
+
+@Serializable
+private data class LlmRelationship(
+    @SerialName("src_id") val srcId: String = "",
+    @SerialName("tgt_id") val tgtId: String = "",
+    val description: String = "",
+    val keywords: String = "",
+    val weight: Double = 1.0,
+    @SerialName("source_id") val sourceId: String? = null,
+)
+
+@Serializable
+private data class ExtractionPayload(
+    val entities: List<LlmEntity> = emptyList(),
+    val relationships: List<LlmRelationship> = emptyList(),
+)
+
+@Serializable
+private data class KeywordPayload(
+    @SerialName("high_level_keywords") val highLevel: List<String> = emptyList(),
+    @SerialName("low_level_keywords") val lowLevel: List<String> = emptyList(),
+)
 
 fun chunkingByTokenSize(
     content: String,
@@ -86,24 +119,19 @@ suspend fun extractEntities(
         val content = chunk["content"]?.toString().orEmpty()
         if (content.isBlank()) continue
         val prompt = Prompts.ENTITY_REL_JSON.replace("{text}", content)
-        val response = llm(prompt, null, emptyList(), false, false, 2048, null)
-        val parsed = Json.parseToJsonElement(extractJsonPayload(response)).jsonObject
-        val entities: List<Map<String, String>> =
-            (parsed["entities"] as? JsonArray)
-                ?.mapNotNull { it as? JsonObject }
-                ?.map { element -> element.mapValues { entry -> entry.value.jsonPrimitive.content } }
-                .orEmpty()
-        val relationships: List<Map<String, String>> =
-            (parsed["relationships"] as? JsonArray)
-                ?.mapNotNull { it as? JsonObject }
-                ?.map { element -> element.mapValues { entry -> entry.value.jsonPrimitive.content } }
-                .orEmpty()
+        val maxTokensForExtraction = (globalConfig["max_tokens_for_extraction"] as? Int) ?: 2048
+        val response = llm(prompt, null, emptyList(), false, false, maxTokensForExtraction, null)
+        val payload =
+            runCatching { Json.decodeFromString<ExtractionPayload>(extractJsonPayload(response)) }
+                .onFailure { logger.warn { "Failed to parse LLM extraction for chunk $chunkId: ${it.message}" } }
+                .getOrElse { ExtractionPayload() }
+        val entities = payload.entities.filter { it.entityName.isNotBlank() }
+        val relationships = payload.relationships.filter { it.srcId.isNotBlank() && it.tgtId.isNotBlank() }
 
         entities.forEach { ent ->
-            val nameRaw = ent["entity_name"] ?: return@forEach
-            val name = "\"${nameRaw.uppercase()}\""
-            val entityType = ent["entity_type"] ?: "UNKNOWN"
-            val description = ent["description"] ?: ""
+            val name = "\"${ent.entityName.trim('"').uppercase()}\""
+            val entityType = ent.entityType.ifBlank { "UNKNOWN" }
+            val description = ent.description
             val nodeData =
                 mapOf(
                     "entity_type" to entityType,
@@ -116,15 +144,13 @@ suspend fun extractEntities(
         }
 
         relationships.forEach { rel ->
-            val srcRaw = rel["src_id"] ?: return@forEach
-            val tgtRaw = rel["tgt_id"] ?: return@forEach
-            val src = "\"${srcRaw.uppercase()}\""
-            val tgt = "\"${tgtRaw.uppercase()}\""
-            val description = rel["description"] ?: ""
-            val keywords = rel["keywords"] ?: ""
+            val src = "\"${rel.srcId.trim('"').uppercase()}\""
+            val tgt = "\"${rel.tgtId.trim('"').uppercase()}\""
+            val description = rel.description
+            val keywords = rel.keywords
             val edgeData =
                 mapOf(
-                    "weight" to (rel["weight"]?.toDoubleOrNull() ?: 1.0),
+                    "weight" to rel.weight,
                     "description" to description,
                     "keywords" to keywords,
                     "source_id" to chunkId,
@@ -187,8 +213,12 @@ private fun extractJsonPayload(response: String): String {
             withoutFence.trim()
         }
     }
-    val match = Regex("\\{.*}\\s*$", RegexOption.DOT_MATCHES_ALL).find(trimmed)
-    return match?.value?.trim() ?: trimmed
+    val firstBrace = trimmed.indexOf('{')
+    val lastBrace = trimmed.lastIndexOf('}')
+    if (firstBrace != -1 && lastBrace > firstBrace) {
+        return trimmed.substring(firstBrace, lastBrace + 1).trim()
+    }
+    return trimmed
 }
 
 suspend fun kgQuery(
@@ -332,10 +362,13 @@ private suspend fun runLocalMode(
     )
 }
 
-private fun String.format(values: Map<String, String>): String =
-    values.entries.fold(this) { acc, (k, v) ->
-        acc.replace("{$k}", v)
+private fun String.format(values: Map<String, String>): String {
+    val placeholder = Regex("\\{([A-Za-z0-9_]+)}")
+    return placeholder.replace(this) { match ->
+        val key = match.groupValues.getOrNull(1)
+        values[key] ?: match.value
     }
+}
 
 private suspend fun getNodeData(
     keywords: String,
@@ -613,15 +646,11 @@ private suspend fun extractKeywords(
             ),
         )
     val raw = llmModel(prompt, null, emptyList(), true, false, 512, null)
-    val parsed = Json.parseToJsonElement(extractJsonPayload(raw)).jsonObject
-    val hl =
-        (parsed["high_level_keywords"] as? JsonArray)
-            ?.joinToString(", ") { it.jsonPrimitive.content }
-            ?: ""
-    val ll =
-        (parsed["low_level_keywords"] as? JsonArray)
-            ?.joinToString(", ") { it.jsonPrimitive.content }
-            ?: ""
+    val parsed =
+        runCatching { Json.decodeFromString<KeywordPayload>(extractJsonPayload(raw)) }
+            .getOrElse { KeywordPayload() }
+    val hl = parsed.highLevel.joinToString(", ")
+    val ll = parsed.lowLevel.joinToString(", ")
     return ll to hl
 }
 

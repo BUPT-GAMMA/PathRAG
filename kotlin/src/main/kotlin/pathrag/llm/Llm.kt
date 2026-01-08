@@ -46,8 +46,8 @@ suspend fun openAiComplete(
         }
     }
 
-    val logRequests = true
-    val logResponses = true
+    val logRequests = System.getenv("OPENAI_LOG_REQUESTS")?.toBoolean() ?: false
+    val logResponses = System.getenv("OPENAI_LOG_RESPONSES")?.toBoolean() ?: false
     val baseUrl = System.getenv("OPENAI_API_BASE")
     val modelName = model.ifBlank { DEFAULT_CHAT_MODEL }
     val chatModel: ChatModel =
@@ -131,8 +131,9 @@ private fun embeddingModelConfig(): Pair<Int, Int> {
         }
     val ctx =
         when {
-            modelName.contains("3-large", ignoreCase = true) -> 8192
-            modelName.contains("3-small", ignoreCase = true) -> 8192
+            modelName.contains("3-large", ignoreCase = true) ||
+                modelName.contains("3-small", ignoreCase = true) -> 8192
+
             else -> DEFAULT_EMBED_CTX
         }
     return dim to ctx
