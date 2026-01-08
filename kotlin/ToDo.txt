@@ -1,0 +1,24 @@
+  - Entity/relationship extraction: Python runs extract_entities with LLM prompts, merging nodes/edges, summarizing
+    descriptions, node2vec, etc. Kotlin has only a no‑op extractEntities, so inserts never build a real graph.
+  Done: - Chunking/tokenization parity: Python uses tiktoken for token-accurate chunk sizes; Kotlin uses naive string chunking, so chunk boundaries and token budgets differ.
+  - Query modes logic:
+      - Python hybrid builds keyword prompts via LLM, runs vector queries for entities/relations, computes path-based
+        relationship context, pageranks/edge degrees, truncates by token counts, and caches LLM responses. Kotlin hybrid
+        just calls global/local directly on the raw query text; no keyword extraction, no path selection, no graph
+        weighting, no cache reuse.
+  - LLM/embedding behavior: Python integrates OpenAI/Azure/Bedrock/Ollama/vLLM etc., with retry, streaming, caching, and
+    quantized embedding cache. Kotlin only calls OpenAI via LangChain4j (or stubs if no API key) and has no embedding
+    cache or retries.
+  - Cache and hashing: Python supports LLM response caching with similarity checks; Kotlin’s cache is a simple in-memory
+    map keyed by mode+hash.
+  - Keyword prompts and prompt templates: Python uses structured prompts (keywords_extraction, rag_response, etc.) and
+    system prompts per mode; Kotlin uses a minimal RAG prompt and doesn’t run keyword extraction.
+  - Graph utilities: Python can delete entities/relations, compute paths (find_paths_and_edges_with_stats), and graph
+    traversal with NetworkX; Kotlin lacks path finding and multi-hop context building.
+  - File I/O/Persistence: Python stores KV/vector/graph data on disk; Kotlin discards everything on process exit.
+  - Config parity: Python uses environment settings like addon_params (language, entity types, example count), model
+    names, node2vec params, embedding cache config; Kotlin ignores most of these.
+
+  Net result: the Kotlin version is a lightweight scaffold with local/global/hybrid context assembly, but it omits the
+  core RAG pipeline (extraction, keywording, path-based retrieval, persistence, rich storage backends, caching, and
+  graph algorithms).

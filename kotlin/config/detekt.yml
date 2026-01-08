@@ -1,0 +1,22 @@
+build:
+  maxIssues: 200
+
+style:
+  MaxLineLength:
+    active: true
+    maxLineLength: 140
+  MagicNumber:
+    active: false
+
+complexity:
+  active: true
+  TooManyFunctions:
+    active: true
+    thresholdInFiles: 11
+    thresholdInClasses: 11
+    thresholdInInterfaces: 11
+    thresholdInObjects: 11
+    thresholdInEnums: 11
+    ignoreDeprecated: false
+    ignorePrivate: false
+    ignoreOverridden: false
