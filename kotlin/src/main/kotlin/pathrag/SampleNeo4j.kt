@@ -65,16 +65,5 @@ fun main() =
         println("Q (hybrid): $question")
         println("A: $hybridAnswer\n")
 
-        // Optional: demonstrate node2vec embeddings from Neo4j GDS
-        val (embFlat, labels) =
-            rag.aquery("ping", pathrag.base.QueryParam()).let { _ ->
-                // use the storage directly to get embeddings
-                val storageField = PathRAG::class.java.getDeclaredField("chunkEntityRelationGraph")
-                storageField.isAccessible = true
-                val storage = storageField.get(rag) as pathrag.base.BaseGraphStorage
-                storage.embedNodes("node2vec")
-            }
-        println("Neo4j node2vec produced ${labels.size} nodes and embedding length ${embFlat.size}.")
-
         println("\nDone with Neo4j-backed graph storage.")
     }

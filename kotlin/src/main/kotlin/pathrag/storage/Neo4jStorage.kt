@@ -10,12 +10,14 @@ import org.neo4j.driver.Record
 import org.neo4j.driver.TransactionContext
 import org.neo4j.driver.Values
 import pathrag.base.BaseGraphStorage
+import java.io.Closeable
 import kotlin.math.abs
 
 class Neo4jStorage(
     override val namespace: String,
     override val globalConfig: Map<String, Any?>,
-) : BaseGraphStorage(namespace, globalConfig) {
+) : BaseGraphStorage(namespace, globalConfig),
+    Closeable {
     private val logger = KotlinLogging.logger("PathRAG-Neo4j")
 
     private val uri: String =
@@ -29,11 +31,18 @@ class Neo4jStorage(
     private val password: String =
         (globalConfig["neo4j_password"] as? String)
             ?: System.getenv("NEO4J_PASSWORD")
-            ?: "password"
+            ?: run {
+                logger.warn { "Using default Neo4j password; set NEO4J_PASSWORD or neo4j_password in config for production." }
+                "password"
+            }
     private val driver: Driver = GraphDatabase.driver(uri, AuthTokens.basic(user, password))
 
     private val nodeLabel = namespace
     private val relType = "${namespace.uppercase()}_REL"
+
+    override fun close() {
+        driver.close()
+    }
 
     private suspend fun <T> read(block: (TransactionContext) -> T): T =
         withContext(Dispatchers.IO) { driver.session().use { session -> session.executeRead { tx -> block(tx) } } }
@@ -209,9 +218,15 @@ class Neo4jStorage(
             val labels = mutableListOf<String>()
             val vectors = mutableListOf<DoubleArray>()
             val graphName = "pathrag_${namespace}_gds"
-            runCatching {
+            try {
                 driver.session().use { session ->
-                    session.run("CALL gds.graph.drop(\$g, false) YIELD graphName", Values.parameters("g", graphName)).consume()
+                    runCatching {
+                        session
+                            .run(
+                                "CALL gds.graph.drop(\$g, false) YIELD graphName",
+                                Values.parameters("g", graphName),
+                            ).consume()
+                    }
                     session
                         .run(
                             "CALL gds.graph.project(\$g, \$labels, {`$relType`:{orientation:'UNDIRECTED'}})",
@@ -232,23 +247,36 @@ class Neo4jStorage(
                         Unit
                     }
                 }
-            }.onFailure { ex -> logger.warn(ex) { "Neo4j node2vec failed; falling back to pagerank/degree." } }
+            } catch (ex: Exception) {
+                logger.warn(ex) { "Neo4j node2vec failed; falling back to pagerank/degree." }
+                return@withContext computeFallbackEmbeddings()
+            } finally {
+                runCatching {
+                    driver.session().use {
+                        it.run("CALL gds.graph.drop(\$g, false) YIELD graphName", Values.parameters("g", graphName)).consume()
+                    }
+                }
+            }
 
             if (labels.isEmpty() || vectors.isEmpty()) {
-                val fallbackLabels = nodes()
-                if (fallbackLabels.isEmpty()) return@withContext DoubleArray(0) to emptyList()
-                val ranks = computePagerank()
-                val degs = fallbackLabels.map { nodeDegree(it).toDouble() }
-                val vecs =
-                    fallbackLabels.mapIndexed { idx, id ->
-                        doubleArrayOf(ranks[id] ?: 0.0, degs[idx])
-                    }
-                val flat = vecs.flatMap { it.asIterable() }.toDoubleArray()
-                return@withContext flat to fallbackLabels
+                return@withContext computeFallbackEmbeddings()
             }
             val flat = vectors.flatMap { it.asIterable() }.toDoubleArray()
             flat to labels
         }
+
+    private suspend fun computeFallbackEmbeddings(): Pair<DoubleArray, List<String>> {
+        val fallbackLabels = nodes()
+        if (fallbackLabels.isEmpty()) return DoubleArray(0) to emptyList()
+        val ranks = computePagerank()
+        val degs = fallbackLabels.map { nodeDegree(it).toDouble() }
+        val vecs =
+            fallbackLabels.mapIndexed { idx, id ->
+                doubleArrayOf(ranks[id] ?: 0.0, degs[idx])
+            }
+        val flat = vecs.flatMap { it.asIterable() }.toDoubleArray()
+        return flat to fallbackLabels
+    }
 
     private suspend fun fetchGraph(): Pair<List<String>, List<Pair<String, String>>> {
         val allNodes = nodes()
@@ -257,6 +285,45 @@ class Neo4jStorage(
     }
 
     private suspend fun computePagerank(
+        damping: Double = 0.85,
+        maxIter: Int = 100,
+        tol: Double = 1e-6,
+    ): Map<String, Double> {
+        val gdsRanks = computePagerankGds()
+        if (gdsRanks.isNotEmpty()) return gdsRanks
+        return computePagerankLocal(damping, maxIter, tol)
+    }
+
+    private suspend fun computePagerankGds(): Map<String, Double> {
+        val ranks = mutableMapOf<String, Double>()
+        val graphName = "pathrag_${namespace}_gds_pagerank"
+        withContext(Dispatchers.IO) {
+            runCatching {
+                driver.session().use { session ->
+                    runCatching { session.run("CALL gds.graph.drop(\$g, false)", Values.parameters("g", graphName)).consume() }
+                    session
+                        .run(
+                            "CALL gds.graph.project(\$g, \$labels, {`$relType`:{orientation:'UNDIRECTED'}})",
+                            Values.parameters("g", graphName, "labels", listOf(nodeLabel)),
+                        ).consume()
+                    val result =
+                        session.run(
+                            "CALL gds.pageRank.stream(\$g) YIELD nodeId, score " +
+                                "RETURN gds.util.asNode(nodeId).id AS id, score",
+                            Values.parameters("g", graphName),
+                        )
+                    result.list { rec: Record ->
+                        ranks[rec.get("id").asString()] = rec.get("score").asDouble()
+                        Unit
+                    }
+                    runCatching { session.run("CALL gds.graph.drop(\$g, false)", Values.parameters("g", graphName)).consume() }
+                }
+            }.onFailure { ex -> logger.warn(ex) { "Neo4j GDS PageRank failed; falling back to in-memory computation." } }
+        }
+        return ranks
+    }
+
+    private suspend fun computePagerankLocal(
         damping: Double = 0.85,
         maxIter: Int = 100,
         tol: Double = 1e-6,

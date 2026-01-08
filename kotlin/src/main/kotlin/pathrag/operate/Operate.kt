@@ -383,7 +383,7 @@ private suspend fun getNodeData(
     if (results.isEmpty()) {
         return Triple(
             emptyCsv(listOf("id", "entity", "type", "description", "rank")),
-            emptyCsv(listOf("id", "context")),
+            emptyCsv(listOf("context")),
             emptyCsv(listOf("id", "content")),
         )
     }
@@ -637,8 +637,11 @@ private suspend fun buildPathRelations(
             v: String,
         ): String? {
             val e = knowledgeGraphInst.getEdge(u, v) ?: knowledgeGraphInst.getEdge(v, u)
-            val kw = e?.get("keywords") ?: return null
-            return "through edge($kw) to connect to $u and $v."
+            val kw = e?.get("keywords")?.toString().orEmpty()
+            val desc = e?.get("description")?.toString().orEmpty()
+            if (kw.isBlank() && desc.isBlank()) return null
+            val edgeInfo = listOfNotNull(desc.takeIf { it.isNotBlank() }, kw.takeIf { it.isNotBlank() }).joinToString("; ")
+            return "through edge($edgeInfo) to connect to $u and $v."
         }
         return when (path.size) {
             2 -> {
