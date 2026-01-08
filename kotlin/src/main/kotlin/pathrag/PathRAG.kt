@@ -14,6 +14,7 @@ import pathrag.operate.extractEntities
 import pathrag.operate.kgQuery
 import pathrag.storage.JsonKVStorage
 import pathrag.storage.NanoVectorDBStorage
+import pathrag.storage.Neo4jStorage
 import pathrag.storage.NetworkXStorage
 import pathrag.utils.ResponseCache
 import pathrag.utils.computeMdHashId
@@ -92,6 +93,7 @@ class PathRAG(
     private fun createGraphStorage(namespace: String): BaseGraphStorage =
         when (graphStorage) {
             "NetworkXStorage" -> NetworkXStorage(namespace, globalConfig(), embeddingFunc)
+            "Neo4jStorage" -> Neo4jStorage(namespace, globalConfig())
             else -> error("Unknown graph storage: $graphStorage")
         }
 

@@ -425,8 +425,8 @@ private suspend fun getNodeData(
         )
     val relationsCsv =
         toCsv(
-            listOf("id", "context"),
-            relations.mapIndexed { idx, r -> listOf(idx.toString(), r) },
+            listOf("context"),
+            relations.map { listOf(it) },
         )
     val textCsv =
         toCsv(
@@ -467,43 +467,220 @@ private suspend fun buildPathRelations(
     val targetNodes = nodeDatas.mapNotNull { it["entity_name"]?.toString() }.distinct()
     if (targetNodes.size < 2) return emptyList()
 
-    val paths = findPathsBetweenTargets(knowledgeGraphInst, targetNodes, maxDepth = 3)
-    val weightedPaths = scorePaths(paths, knowledgeGraphInst).take(15)
-    val selectedPaths = weightedPaths.map { it.first }
-    if (paths.isEmpty()) return emptyList()
-
-    val nodesCache = mutableMapOf<String, Map<String, Any?>>()
-    val allPathNodes = selectedPaths.flatten().toSet()
-    for (name in allPathNodes) {
-        nodesCache[name] = knowledgeGraphInst.getNode(name) ?: emptyMap()
+    val edgesList = knowledgeGraphInst.edges()
+    val adjacency = mutableMapOf<String, MutableSet<String>>()
+    edgesList.forEach { (u, v) ->
+        adjacency.computeIfAbsent(u) { mutableSetOf() }.add(v)
+        adjacency.computeIfAbsent(v) { mutableSetOf() }.add(u)
     }
+    if (adjacency.isEmpty()) return emptyList()
 
-    suspend fun describePath(path: List<String>): String {
-        val pieces = mutableListOf<String>()
-        for ((idx, nodeId) in path.withIndex()) {
-            val node = nodesCache[nodeId] ?: emptyMap()
-            val nodeType = node["entity_type"] ?: "UNKNOWN"
-            val nodeDesc = node["description"] ?: ""
-            pieces.add("Entity $nodeId ($nodeType): $nodeDesc")
-            if (idx < path.lastIndex) {
-                val next = path[idx + 1]
-                val edgeData =
-                    knowledgeGraphInst.getEdge(nodeId, next) ?: knowledgeGraphInst.getEdge(next, nodeId)
-                val edgeKeywords = edgeData?.get("keywords") ?: ""
-                val edgeDesc = edgeData?.get("description") ?: ""
-                pieces.add("Edge [$nodeId -> $next]: keywords=($edgeKeywords), desc=($edgeDesc)")
+    data class PathBucket(
+        val paths: MutableList<List<String>> = mutableListOf(),
+        val edges: MutableSet<Pair<String, String>> = mutableSetOf(),
+    )
+    val result = mutableMapOf<Pair<String, String>, PathBucket>()
+    val oneHopPaths = mutableListOf<List<String>>()
+    val twoHopPaths = mutableListOf<List<String>>()
+    val threeHopPaths = mutableListOf<List<String>>()
+
+    fun dfs(
+        current: String,
+        target: String,
+        path: List<String>,
+        depth: Int,
+    ) {
+        if (depth > 3) return
+        if (current == target) {
+            val key = path.first() to target
+            val bucket = result.getOrPut(key) { PathBucket() }
+            bucket.paths.add(path)
+            path.windowed(2).forEach { (u, v) -> bucket.edges.add(if (u <= v) u to v else v to u) }
+            when (depth) {
+                1 -> oneHopPaths.add(path)
+                2 -> twoHopPaths.add(path)
+                3 -> threeHopPaths.add(path)
+            }
+            return
+        }
+        adjacency[current].orEmpty().forEach { n ->
+            if (n !in path) {
+                dfs(n, target, path + n, depth + 1)
             }
         }
-        return pieces.joinToString(" | ")
+    }
+
+    for (n1 in targetNodes) {
+        for (n2 in targetNodes) {
+            if (n1 != n2) {
+                dfs(n1, n2, listOf(n1), 0)
+            }
+        }
+    }
+
+    fun bfsWeightedPaths(
+        source: String,
+        target: String,
+        paths: List<List<String>>,
+        threshold: Double,
+        alpha: Double,
+    ): List<Pair<List<String>, Double>> {
+        if (paths.isEmpty()) return emptyList()
+        val follow = mutableMapOf<String, MutableSet<String>>()
+        paths.forEach { p ->
+            p.windowed(2).forEach { (u, v) ->
+                follow.computeIfAbsent(u) { mutableSetOf() }.add(v)
+            }
+        }
+        val edgeWeights = mutableMapOf<Pair<String, String>, Double>()
+        val results = mutableListOf<List<String>>()
+
+        fun incEdge(
+            u: String,
+            v: String,
+            add: Double,
+        ) {
+            edgeWeights[u to v] = (edgeWeights[u to v] ?: 0.0) + add
+        }
+
+        for (n in follow[source].orEmpty()) {
+            incEdge(source, n, 1.0 / follow[source]!!.size)
+            if (n == target) {
+                results.add(listOf(source, n))
+                continue
+            }
+            if ((edgeWeights[source to n] ?: 0.0) > threshold) {
+                for (m in follow[n].orEmpty()) {
+                    val w = (edgeWeights[source to n] ?: 0.0) * alpha / follow[n]!!.size
+                    incEdge(n, m, w)
+                    if (m == target) {
+                        results.add(listOf(source, n, m))
+                        continue
+                    }
+                    if ((edgeWeights[n to m] ?: 0.0) > threshold) {
+                        for (k in follow[m].orEmpty()) {
+                            val w2 = (edgeWeights[n to m] ?: 0.0) * alpha / follow[m]!!.size
+                            incEdge(m, k, w2)
+                            if (k == target) {
+                                results.add(listOf(source, n, m, k))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return paths.map { p ->
+            val pw =
+                if (p.size < 2) {
+                    0.0
+                } else {
+                    var sum = 0.0
+                    p.windowed(2).forEach { (u, v) -> sum += edgeWeights[u to v] ?: 0.0 }
+                    sum / (p.size - 1)
+                }
+            p to pw
+        }
+    }
+
+    val threshold = 0.3
+    val alpha = 0.8
+    val allResults = mutableListOf<Pair<List<String>, Double>>()
+    for (n1 in targetNodes) {
+        for (n2 in targetNodes) {
+            if (n1 != n2) {
+                val bucket = result[n1 to n2] ?: continue
+                val paths = bucket.paths
+                val scored = bfsWeightedPaths(n1, n2, paths, threshold, alpha)
+                allResults.addAll(scored)
+            }
+        }
+    }
+    val sortedResults = allResults.sortedByDescending { it.second }
+    val seen = mutableSetOf<String>()
+    val resultEdge = mutableListOf<Pair<List<String>, Double>>()
+    for ((p, w) in sortedResults) {
+        val key = p.sorted().joinToString("|")
+        if (key !in seen) {
+            seen.add(key)
+            resultEdge.add(p to w)
+        }
+    }
+
+    val length1 = oneHopPaths.size / 2
+    val length2 = twoHopPaths.size / 2
+    val length3 = threeHopPaths.size / 2
+    val baseResults = mutableListOf<List<String>>()
+    if (oneHopPaths.isNotEmpty()) baseResults.addAll(oneHopPaths.take(length1))
+    if (twoHopPaths.isNotEmpty()) baseResults.addAll(twoHopPaths.take(length2))
+    if (threeHopPaths.isNotEmpty()) baseResults.addAll(threeHopPaths.take(length3))
+
+    var totalEdges = 15
+    if (baseResults.size < totalEdges) totalEdges = baseResults.size
+    val sortResult =
+        if (resultEdge.isNotEmpty()) {
+            if (resultEdge.size > totalEdges) resultEdge.take(totalEdges) else resultEdge
+        } else {
+            emptyList()
+        }
+    val finalPaths = sortResult.map { it.first }
+
+    suspend fun describePath(path: List<String>): String? {
+        suspend fun nodeDesc(id: String): String {
+            val n = knowledgeGraphInst.getNode(id) ?: return "The entity $id"
+            val t = n["entity_type"] ?: "UNKNOWN"
+            val d = n["description"] ?: ""
+            return "The entity $id is a $t with the description($d)"
+        }
+
+        suspend fun edgeDesc(
+            u: String,
+            v: String,
+        ): String? {
+            val e = knowledgeGraphInst.getEdge(u, v) ?: knowledgeGraphInst.getEdge(v, u)
+            val kw = e?.get("keywords") ?: return null
+            return "through edge($kw) to connect to $u and $v."
+        }
+        return when (path.size) {
+            2 -> {
+                val (s, t) = path
+                val e = edgeDesc(s, t) ?: return null
+                "${nodeDesc(s)} $e ${nodeDesc(t)}"
+            }
+
+            3 -> {
+                val (s, b, t) = path
+                val e1 = edgeDesc(s, b) ?: return null
+                val e2 = edgeDesc(b, t) ?: return null
+                "${nodeDesc(s)} $e1 ${nodeDesc(b)} and ${nodeDesc(b)} $e2 ${nodeDesc(t)}"
+            }
+
+            4 -> {
+                val s = path[0]
+                val b1 = path[1]
+                val b2 = path[2]
+                val t = path[3]
+                val e1 = edgeDesc(s, b1) ?: return null
+                val e2 = edgeDesc(b1, b2) ?: return null
+                val e3 = edgeDesc(b2, t) ?: return null
+                "${nodeDesc(s)} $e1 ${nodeDesc(b1)} and ${nodeDesc(b1)} $e2 ${nodeDesc(b2)} and ${nodeDesc(b2)} $e3 ${nodeDesc(t)}"
+            }
+
+            else -> {
+                null
+            }
+        }
     }
 
     val described = mutableListOf<String>()
-    for (path in selectedPaths.sortedBy { it.size }) {
-        described.add(describePath(path))
+    for (p in finalPaths) {
+        val d = describePath(p)
+        if (d != null) described.add(d)
     }
 
-    return truncateByToken(described.map { mapOf("content" to it) }, queryParam.maxTokenForLocalContext)
-        .map { it["content"].toString() }
+    val truncated =
+        truncateByToken(described.map { mapOf("content" to it) }, queryParam.maxTokenForLocalContext)
+            .map { it["content"].toString() }
+    return truncated.reversed()
 }
 
 private suspend fun findPathsBetweenTargets(
