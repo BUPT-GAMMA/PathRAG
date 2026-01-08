@@ -25,7 +25,12 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.put
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -93,7 +98,7 @@ fun Application.module(env: EnvironmentConfig = EnvironmentConfig.empty()) {
     val userRepository = UserRepository(Paths.get(workingDir, "users.json"))
     val chatRepository = ChatRepository(Paths.get(workingDir, "chats.json"))
     val documentRepository = DocumentRepository(uploadDir, Paths.get(workingDir, "documents.json"))
-    createDefaultUsers(userRepository)
+    runBlocking { createDefaultUsers(userRepository) }
 
     routing {
         get("/") { call.respondRedirect("/swagger") }
@@ -139,6 +144,7 @@ class UserRepository(
 ) {
     private val users = mutableListOf<User>()
     private var nextId = 1
+    private val mutex = Mutex()
     private val json =
         Json {
             prettyPrint = true
@@ -146,55 +152,62 @@ class UserRepository(
         }
 
     init {
-        load()
+        runBlocking { load() }
     }
 
-    fun count(): Int = users.size
+    suspend fun count(): Int = mutex.withLock { users.size }
 
-    fun add(user: User): User {
-        val stored =
-            if (user.id == null) user.copy(id = nextId++) else user.copy(id = user.id)
-        users.add(stored)
-        persist()
-        return stored
-    }
+    suspend fun add(user: User): User =
+        mutex.withLock {
+            val stored =
+                if (user.id == null) user.copy(id = nextId++) else user.copy(id = user.id)
+            users.add(stored)
+            persist()
+            stored
+        }
 
-    fun find(username: String): User? = users.find { it.username == username }
+    suspend fun find(username: String): User? = mutex.withLock { users.find { it.username == username } }
 
-    fun updateTheme(
+    suspend fun updateTheme(
         username: String,
         theme: String,
-    ): User? {
-        val idx = users.indexOfFirst { it.username == username }
-        if (idx == -1) return null
-        val updated = users[idx].copy(theme = theme, updatedAt = Instant.now().toString())
-        users[idx] = updated
-        persist()
-        return updated
-    }
+    ): User? =
+        mutex.withLock {
+            val idx = users.indexOfFirst { it.username == username }
+            if (idx == -1) return@withLock null
+            val updated = users[idx].copy(theme = theme, updatedAt = Instant.now().toString())
+            users[idx] = updated
+            persist()
+            updated
+        }
 
-    fun list(): List<User> = users.toList()
+    suspend fun list(): List<User> = mutex.withLock { users.toList() }
 
-    private fun load() {
+    private suspend fun load() {
         val file = filePath?.toFile() ?: return
         if (!file.exists()) return
-        runCatching {
-            val parsed = json.decodeFromString<List<User>>(file.readText())
+        val parsed =
+            withContext(Dispatchers.IO) {
+                runCatching { json.decodeFromString<List<User>>(file.readText()) }
+                    .onFailure { ex -> logger.warn(ex) { "Failed to load users from ${file.absolutePath}" } }
+                    .getOrNull()
+            } ?: return
+        mutex.withLock {
             users.clear()
             users.addAll(parsed)
             nextId = (users.maxOfOrNull { it.id ?: 0 } ?: 0) + 1
-        }.onFailure { ex ->
-            logger.warn(ex) { "Failed to load users from ${file.absolutePath}" }
         }
     }
 
-    private fun persist() {
+    private suspend fun persist() {
         val file = filePath?.toFile() ?: return
-        runCatching {
-            file.parentFile?.mkdirs()
-            file.writeText(json.encodeToString(users))
-        }.onFailure { ex ->
-            logger.warn(ex) { "Failed to persist users to ${file.absolutePath}" }
+        withContext(Dispatchers.IO) {
+            runCatching {
+                file.parentFile?.mkdirs()
+                file.writeText(json.encodeToString(users))
+            }.onFailure { ex ->
+                logger.warn(ex) { "Failed to persist users to ${file.absolutePath}" }
+            }
         }
     }
 }
@@ -212,7 +225,7 @@ data class User(
 
 private val defaultUsersCreated = AtomicBoolean(false)
 
-private fun createDefaultUsers(repository: UserRepository) {
+private suspend fun createDefaultUsers(repository: UserRepository) {
     if (defaultUsersCreated.get()) return
 
     if (repository.count() == 0) {
@@ -318,6 +331,7 @@ class ChatRepository(
     private val threads = mutableMapOf<String, ChatThread>()
     private var nextThreadId = 1
     private var nextMessageId = 1
+    private val mutex = Mutex()
     private val json =
         Json {
             prettyPrint = true
@@ -325,98 +339,108 @@ class ChatRepository(
         }
 
     init {
-        load()
+        runBlocking { load() }
     }
 
-    fun allThreads(): List<ChatThread> = threads.values.toList()
+    suspend fun allThreads(): List<ChatThread> = mutex.withLock { threads.values.toList() }
 
-    fun recentThreads(limit: Int = 5): List<ChatThread> = threads.values.sortedByDescending { it.updatedAt }.take(limit)
+    suspend fun recentThreads(limit: Int = 5): List<ChatThread> =
+        mutex.withLock { threads.values.sortedByDescending { it.updatedAt }.take(limit) }
 
-    fun thread(id: String): ChatThread? = threads[id]
+    suspend fun thread(id: String): ChatThread? = mutex.withLock { threads[id] }
 
-    fun addThread(title: String): ChatThread {
-        val uuid =
-            java.util.UUID
-                .randomUUID()
-                .toString()
-        val thread =
-            ChatThread(
-                id = nextThreadId++,
-                uuid = uuid,
-                userId = 1,
-                title = title,
-            )
-        threads[uuid] = thread
-        persist()
-        return thread
-    }
+    suspend fun addThread(title: String): ChatThread =
+        mutex.withLock {
+            val uuid =
+                java.util.UUID
+                    .randomUUID()
+                    .toString()
+            val thread =
+                ChatThread(
+                    id = nextThreadId++,
+                    uuid = uuid,
+                    userId = 1,
+                    title = title,
+                )
+            threads[uuid] = thread
+            persist()
+            thread
+        }
 
-    fun updateThreadTitle(
+    suspend fun updateThreadTitle(
         id: String,
         title: String,
-    ): ChatThread? {
-        val current = threads[id] ?: return null
-        val updated = current.copy(title = title, updatedAt = Instant.now().toString())
-        threads[id] = updated
-        persist()
-        return updated
-    }
+    ): ChatThread? =
+        mutex.withLock {
+            val current = threads[id] ?: return@withLock null
+            val updated = current.copy(title = title, updatedAt = Instant.now().toString())
+            threads[id] = updated
+            persist()
+            updated
+        }
 
-    fun markDeleted(id: String): ChatThread? {
-        val current = threads[id] ?: return null
-        val updated = current.copy(isDeleted = true, updatedAt = Instant.now().toString())
-        threads[id] = updated
-        persist()
-        return updated
-    }
+    suspend fun markDeleted(id: String): ChatThread? =
+        mutex.withLock {
+            val current = threads[id] ?: return@withLock null
+            val updated = current.copy(isDeleted = true, updatedAt = Instant.now().toString())
+            threads[id] = updated
+            persist()
+            updated
+        }
 
-    fun addChat(
+    suspend fun addChat(
         threadId: String,
         content: String,
         sender: String = "user",
-    ): ChatMessage? {
-        val current = threads[threadId] ?: return null
-        val message =
-            ChatMessage(
-                id = nextMessageId++,
-                threadId = current.id,
-                userId = 1,
-                role = sender,
-                message = content,
-            )
-        val updated =
-            current.copy(
-                chats = current.chats + message,
-                updatedAt = Instant.now().toString(),
-            )
-        threads[threadId] = updated
-        persist()
-        return message
-    }
+    ): ChatMessage? =
+        mutex.withLock {
+            val current = threads[threadId] ?: return@withLock null
+            val message =
+                ChatMessage(
+                    id = nextMessageId++,
+                    threadId = current.id,
+                    userId = 1,
+                    role = sender,
+                    message = content,
+                )
+            val updated =
+                current.copy(
+                    chats = current.chats + message,
+                    updatedAt = Instant.now().toString(),
+                )
+            threads[threadId] = updated
+            persist()
+            message
+        }
 
-    private fun load() {
+    private suspend fun load() {
         val file = filePath?.toFile() ?: return
         if (!file.exists()) return
-        runCatching {
-            val parsed = json.decodeFromString<List<ChatThread>>(file.readText())
+        val parsed =
+            withContext(Dispatchers.IO) {
+                runCatching { json.decodeFromString<List<ChatThread>>(file.readText()) }
+                    .onFailure { ex -> logger.warn(ex) { "Failed to load chats from ${file.absolutePath}" } }
+                    .getOrNull()
+            } ?: return
+        mutex.withLock {
             threads.clear()
             parsed.forEach { threads[it.uuid] = it }
             nextThreadId = (parsed.maxOfOrNull { it.id } ?: 0) + 1
             val maxMsgId =
                 parsed.flatMap { it.chats }.maxOfOrNull { it.id } ?: 0
             nextMessageId = maxMsgId + 1
-        }.onFailure { ex ->
-            logger.warn(ex) { "Failed to load chats from ${file.absolutePath}" }
         }
     }
 
-    private fun persist() {
+    private suspend fun persist() {
         val file = filePath?.toFile() ?: return
-        runCatching {
-            file.parentFile?.mkdirs()
-            file.writeText(json.encodeToString(threads.values.toList()))
-        }.onFailure { ex ->
-            logger.warn(ex) { "Failed to persist chats to ${file.absolutePath}" }
+        withContext(Dispatchers.IO) {
+            runCatching {
+                file.parentFile?.mkdirs()
+                file.writeText(json.encodeToString(threads.values.toList()))
+            }.onFailure { ex ->
+                logger.warn(ex) { "Failed to persist chats to ${file.absolutePath}" }
+            }
         }
     }
 }
@@ -427,6 +451,7 @@ class DocumentRepository(
 ) {
     private val documents = mutableMapOf<Int, DocumentInfo>()
     private var nextId = 1
+    private val mutex = Mutex()
     private val json =
         Json {
             prettyPrint = true
@@ -434,69 +459,77 @@ class DocumentRepository(
         }
 
     init {
-        load()
+        runBlocking { load() }
     }
 
-    fun all(): List<DocumentInfo> = documents.values.toList()
+    suspend fun all(): List<DocumentInfo> = mutex.withLock { documents.values.toList() }
 
-    fun get(id: Int): DocumentInfo? = documents[id]
+    suspend fun get(id: Int): DocumentInfo? = mutex.withLock { documents[id] }
 
-    fun add(
+    suspend fun add(
         name: String,
         content: String,
         contentType: String = "text/plain",
         userId: Int = 1,
-    ): DocumentInfo {
-        val id = nextId++
-        val filePath = File(uploadDir, "${id}_$name").absolutePath
-        val info =
-            DocumentInfo(
-                id = id,
-                userId = userId,
-                filename = name,
-                contentType = contentType,
-                filePath = filePath,
-                fileSize = content.toByteArray().size.toLong(),
-            )
-        documents[id] = info
-        saveToDisk(filePath, content)
-        persist()
-        return info
-    }
+    ): DocumentInfo =
+        mutex.withLock {
+            val id = nextId++
+            val filePath = File(uploadDir, "${id}_$name").absolutePath
+            val info =
+                DocumentInfo(
+                    id = id,
+                    userId = userId,
+                    filename = name,
+                    contentType = contentType,
+                    filePath = filePath,
+                    fileSize = content.toByteArray().size.toLong(),
+                )
+            documents[id] = info
+            saveToDisk(filePath, content)
+            persist()
+            info
+        }
 
-    fun status(id: Int): String = documents[id]?.status ?: "unknown"
+    suspend fun status(id: Int): String = mutex.withLock { documents[id]?.status ?: "unknown" }
 
-    private fun saveToDisk(
+    private suspend fun saveToDisk(
         path: String,
         content: String,
     ) {
-        runCatching {
-            File(path).writeText(content)
-        }.onFailure { ex ->
-            logger.warn(ex) { "Failed to persist document at $path" }
+        withContext(Dispatchers.IO) {
+            runCatching {
+                File(path).writeText(content)
+            }.onFailure { ex ->
+                logger.warn(ex) { "Failed to persist document at $path" }
+            }
         }
     }
 
-    private fun load() {
+    private suspend fun load() {
         val file = filePath?.toFile() ?: return
         if (!file.exists()) return
-        runCatching {
-            val parsed = json.decodeFromString<List<DocumentInfo>>(file.readText())
+        val parsed =
+            withContext(Dispatchers.IO) {
+                runCatching { json.decodeFromString<List<DocumentInfo>>(file.readText()) }
+                    .onFailure { ex -> logger.warn(ex) { "Failed to load documents from ${file.absolutePath}" } }
+                    .getOrNull()
+            } ?: return
+        mutex.withLock {
             documents.clear()
             parsed.forEach { documents[it.id] = it }
             nextId = (documents.keys.maxOrNull() ?: 0) + 1
-        }.onFailure { ex ->
-            logger.warn(ex) { "Failed to load documents from ${file.absolutePath}" }
         }
     }
 
-    private fun persist() {
+    private suspend fun persist() {
         val file = filePath?.toFile() ?: return
-        runCatching {
-            file.parentFile?.mkdirs()
-            file.writeText(json.encodeToString(documents.values.toList()))
-        }.onFailure { ex ->
-            logger.warn(ex) { "Failed to persist documents to ${file.absolutePath}" }
+        withContext(Dispatchers.IO) {
+            runCatching {
+                file.parentFile?.mkdirs()
+                file.writeText(json.encodeToString(documents.values.toList()))
+            }.onFailure { ex ->
+                logger.warn(ex) { "Failed to persist documents to ${file.absolutePath}" }
+            }
         }
     }
 }
@@ -637,6 +670,12 @@ private data class QueryRequest(
 )
 
 @Serializable
+private data class KnowledgeGraphQuery(
+    val query: String? = null,
+    val q: String? = null,
+)
+
+@Serializable
 private data class DocumentStatusResponse(
     val documentId: Int,
     val status: String,
@@ -672,7 +711,7 @@ private fun Route.documentRoutes(
         post("/upload") {
             val req = call.receive<UploadDocumentRequest>()
             val doc = repository.add(req.name, req.content, req.contentType ?: "text/plain", req.userId ?: 1)
-            rag.insert(req.content)
+            launch { rag.ainsert(req.content) }
             call.respond(HttpStatusCode.Created, doc)
         }
         post("/query") {
@@ -719,31 +758,9 @@ private fun Route.knowledgeGraphRoutes(rag: PathRAG) {
                 }
         call.respond(GraphResponse(nodes, edges))
     }
-    get("/knowledge-graph/") {
-        val g = rag.graph()
-        val nodeIds = g.nodes()
-        val nodes =
-            nodeIds.map { id ->
-                GraphNodeDto(
-                    id = id,
-                    properties = toStringMap(g.getNode(id)),
-                )
-            }
-        val edges =
-            g
-                .edges()
-                .map { (u, v) ->
-                    GraphEdgeDto(
-                        source = u,
-                        target = v,
-                        properties = toStringMap(g.getEdge(u, v) ?: g.getEdge(v, u)),
-                    )
-                }
-        call.respond(GraphResponse(nodes, edges))
-    }
     post("/knowledge-graph/query") {
-        val payload = runCatching { call.receive<Map<String, Any?>>() }.getOrElse { emptyMap() }
-        val question = payload["query"] as? String ?: payload["q"] as? String
+        val payload = runCatching { call.receive<KnowledgeGraphQuery>() }.getOrNull()
+        val question = payload?.query ?: payload?.q
         if (question.isNullOrBlank()) {
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing 'query' in payload"))
         } else {

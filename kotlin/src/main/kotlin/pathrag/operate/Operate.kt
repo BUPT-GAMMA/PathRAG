@@ -683,7 +683,7 @@ private suspend fun buildPathRelations(
     val truncated =
         truncateByToken(described.map { mapOf("content" to it) }, queryParam.maxTokenForLocalContext)
             .map { it["content"].toString() }
-    return truncated.reversed()
+    return truncated
 }
 
 private suspend fun findPathsBetweenTargets(
