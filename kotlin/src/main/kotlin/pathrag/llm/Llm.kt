@@ -79,12 +79,22 @@ suspend fun openAiComplete(
 
     val result: String =
         withContext(Dispatchers.IO) {
-            try {
-                chatModel.chat(fullPrompt)
-            } catch (e: Exception) {
-                logger.error(e) { "OpenAI chat call failed for model $modelName" }
-                Prompts.FAIL_RESPONSE
+            val maxAttempts = (System.getenv("OPENAI_RETRY_ATTEMPTS")?.toIntOrNull() ?: 3).coerceAtLeast(1)
+            val backoffMs = (System.getenv("OPENAI_RETRY_BACKOFF_MS")?.toLongOrNull() ?: 500L).coerceAtLeast(0L)
+            var lastError: Exception? = null
+            repeat(maxAttempts) { attempt ->
+                try {
+                    return@withContext chatModel.chat(fullPrompt)
+                } catch (e: Exception) {
+                    lastError = e
+                    logger.warn(e) { "OpenAI chat attempt ${attempt + 1} failed for model $modelName" }
+                    if (attempt < maxAttempts - 1) {
+                        Thread.sleep(backoffMs)
+                    }
+                }
             }
+            logger.error(lastError) { "OpenAI chat call failed after $maxAttempts attempts for model $modelName" }
+            Prompts.FAIL_RESPONSE
         }
     return result
 }
@@ -109,20 +119,30 @@ suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
         }
 
     return withContext(Dispatchers.IO) {
-        try {
-            val segments = inputs.map { TextSegment.from(it) }
-            val response: Response<List<Embedding>> = embedModel.embedAll(segments)
-            response.content().map { embedding ->
-                val vector = embedding.vector()
-                DoubleArray(vector.size) { idx -> vector[idx].toDouble() }
+        val maxAttempts = (System.getenv("OPENAI_RETRY_ATTEMPTS")?.toIntOrNull() ?: 3).coerceAtLeast(1)
+        val backoffMs = (System.getenv("OPENAI_RETRY_BACKOFF_MS")?.toLongOrNull() ?: 500L).coerceAtLeast(0L)
+        var lastError: Exception? = null
+        repeat(maxAttempts) { attempt ->
+            try {
+                val segments = inputs.map { TextSegment.from(it) }
+                val response: Response<List<Embedding>> = embedModel.embedAll(segments)
+                return@withContext response.content().map { embedding ->
+                    val vector = embedding.vector()
+                    DoubleArray(vector.size) { idx -> vector[idx].toDouble() }
+                }
+            } catch (e: Exception) {
+                lastError = e
+                logger.warn(e) { "OpenAI embedding attempt ${attempt + 1} failed for model $modelName" }
+                if (attempt < maxAttempts - 1) {
+                    Thread.sleep(backoffMs)
+                }
             }
-        } catch (e: Exception) {
-            logger.error(e) { "OpenAI embedding call failed for model $modelName" }
-            inputs.map { text ->
-                val seed = text.hashCode()
-                val random = Random(seed)
-                DoubleArray(1536) { random.nextDouble() }
-            }
+        }
+        logger.error(lastError) { "OpenAI embedding call failed after $maxAttempts attempts for model $modelName" }
+        inputs.map { text ->
+            val seed = text.hashCode()
+            val random = Random(seed)
+            DoubleArray(DEFAULT_EMBED_DIM) { random.nextDouble() }
         }
     }
 }

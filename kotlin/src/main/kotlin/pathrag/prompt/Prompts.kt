@@ -20,12 +20,19 @@ If you don't know the answer, just say so. Do not make anything up.
 Add sections and commentary to the response as appropriate for the length and format. Style the response in markdown.
 """
 
-    const val KEYWORDS_EXTRACTION = """Given the query, list both high-level and low-level keywords in JSON.
-Query: {query}
-Examples:
+    const val KEYWORDS_EXTRACTION = """---Role---
+You extract concise keywords from user queries.
+---Goal---
+Return high-level and low-level keywords as JSON arrays.
+---Language---
+Use {language}.
+---Input Query---
+{query}
+---Examples---
 {examples}
-Output keys: "high_level_keywords" and "low_level_keywords".
-The Output should be human text, not unicode characters. Keep the same language as Query.
+---Output Format---
+{ "high_level_keywords": [...], "low_level_keywords": [...] }
+Only return JSON.
 """
 
     const val ENTITY_REL_JSON = """

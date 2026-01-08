@@ -46,7 +46,7 @@ class PathRAG(
             )
         }
 
-    private val llmResponseCache = ResponseCache()
+    private val llmResponseCache = ResponseCache(globalConfig())
 
     private fun createKvStorage(namespace: String): BaseKVStorage<Map<String, Any>> =
         when (kvStorage) {

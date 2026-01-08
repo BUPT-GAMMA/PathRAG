@@ -241,7 +241,7 @@ suspend fun kgQuery(
 ): String =
     withContext(Dispatchers.Default) {
         val argsHash = computeArgsHash(queryParam.mode, query)
-        val cached = hashingKv?.getById(queryParam.mode)?.get(argsHash)
+        val cached = hashingKv?.handleCache(argsHash, query, queryParam.mode)
         if (cached != null) return@withContext cached
 
         val (llKeywords, hlKeywords) = extractKeywords(llmModel, query, globalConfig)
@@ -293,7 +293,7 @@ suspend fun kgQuery(
                     "Unknown mode ${queryParam.mode}"
                 }
             }
-        hashingKv?.upsert(queryParam.mode, argsHash, response)
+        hashingKv?.upsert(queryParam.mode, argsHash, response, query)
         response
     }
 
@@ -405,7 +405,7 @@ private suspend fun getNodeData(
         }
 
     val textUnits = findMostRelatedTextUnitFromEntities(nodeDatas, queryParam, textChunksDb)
-    val relations = emptyList<String>() // local mode: no path exploration yet
+    val relations = buildPathRelations(nodeDatas, knowledgeGraphInst, queryParam)
 
     val entitiesCsv =
         toCsv(
@@ -454,6 +454,92 @@ private suspend fun findMostRelatedTextUnitFromEntities(
     val chunks = textChunksDb.getByIds(uniqueIds)
     val valid = chunks.mapNotNull { it }.take(queryParam.topK)
     return truncateByToken(valid, queryParam.maxTokenForTextUnit)
+}
+
+private suspend fun buildPathRelations(
+    nodeDatas: List<Map<String, Any>>,
+    knowledgeGraphInst: BaseGraphStorage,
+    queryParam: QueryParam,
+): List<String> {
+    val targetNodes = nodeDatas.mapNotNull { it["entity_name"]?.toString() }.distinct()
+    if (targetNodes.size < 2) return emptyList()
+
+    val paths = findPathsBetweenTargets(knowledgeGraphInst, targetNodes, maxDepth = 3)
+    if (paths.isEmpty()) return emptyList()
+
+    val nodesCache = mutableMapOf<String, Map<String, Any?>>()
+    for (name in targetNodes) {
+        nodesCache[name] = knowledgeGraphInst.getNode(name) ?: emptyMap()
+    }
+
+    suspend fun describePath(path: List<String>): String {
+        val pieces = mutableListOf<String>()
+        for ((idx, nodeId) in path.withIndex()) {
+            val node = nodesCache[nodeId] ?: emptyMap()
+            val nodeType = node["entity_type"] ?: "UNKNOWN"
+            val nodeDesc = node["description"] ?: ""
+            pieces.add("Entity $nodeId ($nodeType): $nodeDesc")
+            if (idx < path.lastIndex) {
+                val next = path[idx + 1]
+                val edgeData =
+                    knowledgeGraphInst.getEdge(nodeId, next) ?: knowledgeGraphInst.getEdge(next, nodeId)
+                val edgeKeywords = edgeData?.get("keywords") ?: ""
+                val edgeDesc = edgeData?.get("description") ?: ""
+                pieces.add("Edge [$nodeId -> $next]: keywords=($edgeKeywords), desc=($edgeDesc)")
+            }
+        }
+        return pieces.joinToString(" | ")
+    }
+
+    val described = mutableListOf<String>()
+    for (path in paths.sortedBy { it.size }) {
+        described.add(describePath(path))
+    }
+
+    return truncateByToken(described.map { mapOf("content" to it) }, queryParam.maxTokenForLocalContext)
+        .map { it["content"].toString() }
+}
+
+private suspend fun findPathsBetweenTargets(
+    knowledgeGraphInst: BaseGraphStorage,
+    targets: List<String>,
+    maxDepth: Int = 3,
+): List<List<String>> {
+    val adjacency = mutableMapOf<String, MutableSet<String>>()
+    knowledgeGraphInst.edges().forEach { (u, v) ->
+        adjacency.computeIfAbsent(u) { mutableSetOf() }.add(v)
+        adjacency.computeIfAbsent(v) { mutableSetOf() }.add(u)
+    }
+    if (adjacency.isEmpty()) return emptyList()
+
+    fun neighbors(node: String): Set<String> = adjacency[node] ?: emptySet()
+
+    val results = mutableSetOf<List<String>>()
+
+    fun dfs(
+        current: String,
+        target: String,
+        path: List<String>,
+    ) {
+        if (path.size > maxDepth + 1) return
+        if (current == target) {
+            results.add(path)
+            return
+        }
+        for (n in neighbors(current)) {
+            if (n !in path) {
+                dfs(n, target, path + n)
+            }
+        }
+    }
+
+    for (i in targets.indices) {
+        for (j in i + 1 until targets.size) {
+            dfs(targets[i], targets[j], listOf(targets[i]))
+        }
+    }
+
+    return results.toList()
 }
 
 private suspend fun runGlobalMode(
@@ -639,11 +725,13 @@ private suspend fun extractKeywords(
     globalConfig: Map<String, Any?>,
 ): Pair<String, String> {
     val examples = (globalConfig["keywords_examples"] as? String).orEmpty()
+    val language = (globalConfig["language"] as? String) ?: Prompts.DEFAULT_LANGUAGE
     val prompt =
         Prompts.KEYWORDS_EXTRACTION.format(
             mapOf(
                 "query" to query,
                 "examples" to examples,
+                "language" to language,
             ),
         )
     val raw = llmModel(prompt, null, emptyList(), true, false, 512, null)
