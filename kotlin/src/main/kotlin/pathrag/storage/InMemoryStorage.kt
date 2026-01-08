@@ -125,6 +125,20 @@ class NanoVectorDBStorage(
         }
     }
 
+    override suspend fun deleteRelationBetween(
+        srcId: String,
+        tgtId: String,
+    ) {
+        val relId = computeMdHashId(srcId + tgtId, prefix = "rel-")
+        mutex.withLock {
+            entries.remove(relId)
+        }
+    }
+
+    override suspend fun drop() {
+        mutex.withLock { entries.clear() }
+    }
+
     private fun cosineSimilarity(
         a: DoubleArray,
         b: DoubleArray,
@@ -199,6 +213,16 @@ class NetworkXStorage(
         mutex.withLock {
             nodes.remove(nodeId)
             edges.keys.filter { it.first == nodeId || it.second == nodeId }.forEach { edges.remove(it) }
+            cachedPagerank = null
+        }
+    }
+
+    override suspend fun deleteEdge(
+        sourceNodeId: String,
+        targetNodeId: String,
+    ) {
+        mutex.withLock {
+            edges.remove(sourceNodeId to targetNodeId)
             cachedPagerank = null
         }
     }
@@ -297,5 +321,13 @@ class NetworkXStorage(
             if (diff < tol) return rank
         }
         return rank
+    }
+
+    override suspend fun drop() {
+        mutex.withLock {
+            nodes.clear()
+            edges.clear()
+            cachedPagerank = null
+        }
     }
 }

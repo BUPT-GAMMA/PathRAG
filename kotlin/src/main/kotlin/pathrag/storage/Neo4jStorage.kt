@@ -181,6 +181,18 @@ class Neo4jStorage(
         }
     }
 
+    override suspend fun deleteEdge(
+        sourceNodeId: String,
+        targetNodeId: String,
+    ) {
+        write { tx ->
+            tx.run(
+                "MATCH (s:$nodeLabel {id:\$src})-[r:$relType]->(t:$nodeLabel {id:\$tgt}) DELETE r",
+                Values.parameters("src", sourceNodeId, "tgt", targetNodeId),
+            )
+        }
+    }
+
     override suspend fun nodes(): List<String> =
         read { tx -> tx.run("MATCH (n:$nodeLabel) RETURN n.id AS id").list { it.get("id").asString() } }
 
@@ -194,6 +206,10 @@ class Neo4jStorage(
     override suspend fun getPagerank(nodeId: String): Double {
         val ranks = computePagerank()
         return ranks[nodeId] ?: 0.0
+    }
+
+    override suspend fun drop() {
+        write { tx -> tx.run("MATCH (n:$nodeLabel) DETACH DELETE n") }
     }
 
     override suspend fun embedNodes(algorithm: String): Pair<DoubleArray, List<String>> {

@@ -4,6 +4,8 @@ import dev.langchain4j.data.embedding.Embedding
 import dev.langchain4j.data.segment.TextSegment
 import dev.langchain4j.model.chat.ChatModel
 import dev.langchain4j.model.embedding.EmbeddingModel
+import dev.langchain4j.model.ollama.OllamaChatModel
+import dev.langchain4j.model.ollama.OllamaEmbeddingModel
 import dev.langchain4j.model.openai.OpenAiChatModel
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel
 import dev.langchain4j.model.output.Response
@@ -18,9 +20,12 @@ import kotlin.random.Random
 
 private val logger = KotlinLogging.logger("PathRAG-LLM")
 private const val DEFAULT_CHAT_MODEL = "gpt-4o-mini"
+private const val DEFAULT_OLLAMA_MODEL = "llama3"
 private const val DEFAULT_EMBED_MODEL = "text-embedding-3-small"
+private const val DEFAULT_OLLAMA_EMBED_MODEL = "nomic-embed-text"
 private const val DEFAULT_EMBED_DIM = 1536
 private const val DEFAULT_EMBED_CTX = 8192
+private const val DEFAULT_OLLAMA_EMBED_DIM = 768
 
 private val chatModels = ConcurrentHashMap<String, ChatModel>()
 private val embeddingModels = ConcurrentHashMap<String, EmbeddingModel>()
@@ -99,6 +104,47 @@ suspend fun openAiComplete(
     return result
 }
 
+suspend fun ollamaComplete(
+    model: String,
+    prompt: String,
+    systemPrompt: String? = null,
+    historyMessages: List<Map<String, String>> = emptyList(),
+    keywordExtraction: Boolean = false,
+    stream: Boolean = false,
+    maxTokens: Int? = null,
+    hashingKv: Any? = null,
+): String {
+    val baseUrl = System.getenv("OLLAMA_BASE_URL") ?: System.getenv("OLLAMA_HOST") ?: "http://localhost:11434"
+    val modelName = model.ifBlank { System.getenv("OLLAMA_MODEL") ?: DEFAULT_OLLAMA_MODEL }
+    val chatModel: ChatModel =
+        chatModels.computeIfAbsent("ollama|$modelName|$baseUrl") {
+            OllamaChatModel
+                .builder()
+                .baseUrl(baseUrl)
+                .modelName(modelName)
+                .build()
+        }
+
+    val fullPrompt =
+        buildString {
+            if (!systemPrompt.isNullOrBlank()) {
+                appendLine(systemPrompt)
+            }
+            if (historyMessages.isNotEmpty()) {
+                historyMessages.forEach { msg ->
+                    appendLine("${msg["role"] ?: "user"}: ${msg["content"] ?: ""}")
+                }
+            }
+            append(prompt)
+        }
+
+    return withContext(Dispatchers.IO) {
+        runCatching { chatModel.chat(fullPrompt) }
+            .onFailure { logger.warn(it) { "Ollama chat call failed for model $modelName" } }
+            .getOrElse { Prompts.FAIL_RESPONSE }
+    }
+}
+
 suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
     val apiKey = System.getenv("OPENAI_API_KEY")
     val sanitized = inputs.filter { it.isNotBlank() }
@@ -145,38 +191,81 @@ suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
     }
 }
 
+suspend fun ollamaEmbedding(inputs: List<String>): List<DoubleArray> {
+    val sanitized = inputs.filter { it.isNotBlank() }
+    if (sanitized.isEmpty()) return emptyList()
+    val baseUrl = System.getenv("OLLAMA_BASE_URL") ?: System.getenv("OLLAMA_HOST") ?: "http://localhost:11434"
+    val modelName = System.getenv("OLLAMA_EMBED_MODEL") ?: DEFAULT_OLLAMA_EMBED_MODEL
+    val embedModel: EmbeddingModel =
+        embeddingModels.computeIfAbsent("ollama|$modelName|$baseUrl") {
+            OllamaEmbeddingModel
+                .builder()
+                .baseUrl(baseUrl)
+                .modelName(modelName)
+                .build()
+        }
+
+    return withContext(Dispatchers.IO) {
+        runCatching {
+            val segments = sanitized.map { TextSegment.from(it) }
+            val response: Response<List<Embedding>> = embedModel.embedAll(segments)
+            response.content().map { embedding ->
+                val vector = embedding.vector()
+                DoubleArray(vector.size) { idx -> vector[idx].toDouble() }
+            }
+        }.onFailure { ex ->
+            logger.warn(ex) { "Ollama embedding call failed for model $modelName" }
+        }.getOrDefault(emptyList())
+    }
+}
+
 fun defaultEmbeddingFunc(): EmbeddingFunc =
-    embeddingModelConfig().let { (dim, ctx) ->
+    embeddingModelConfig().let { (provider, dim, ctx) ->
+        val func =
+            when (provider) {
+                "ollama" -> ::ollamaEmbedding
+                else -> ::openAiEmbedding
+            }
         EmbeddingFunc(
             embeddingDim = dim,
             maxTokenSize = ctx,
-            func = ::openAiEmbedding,
+            func = func,
         )
     }
 
-private fun embeddingModelConfig(): Pair<Int, Int> {
-    val modelName = System.getenv("OPENAI_EMBEDDING_MODEL") ?: DEFAULT_EMBED_MODEL
-    val dim =
-        when {
-            modelName.contains("3-large", ignoreCase = true) -> {
-                3072
-            }
-
-            modelName.contains("3-small", ignoreCase = true) -> {
-                1536
-            }
-
-            else -> {
-                logger.warn { "Unrecognized embedding model '$modelName'; using default dim $DEFAULT_EMBED_DIM" }
-                DEFAULT_EMBED_DIM
-            }
+private fun embeddingModelConfig(): Triple<String, Int, Int> {
+    val provider = System.getenv("EMBED_PROVIDER")?.lowercase() ?: "openai"
+    return when (provider) {
+        "ollama" -> {
+            val dim = System.getenv("OLLAMA_EMBED_DIM")?.toIntOrNull() ?: DEFAULT_OLLAMA_EMBED_DIM
+            Triple("ollama", dim, DEFAULT_EMBED_CTX)
         }
-    val ctx =
-        when {
-            modelName.contains("3-large", ignoreCase = true) ||
-                modelName.contains("3-small", ignoreCase = true) -> 8192
 
-            else -> DEFAULT_EMBED_CTX
+        else -> {
+            val modelName = System.getenv("OPENAI_EMBEDDING_MODEL") ?: DEFAULT_EMBED_MODEL
+            val dim =
+                when {
+                    modelName.contains("3-large", ignoreCase = true) -> {
+                        3072
+                    }
+
+                    modelName.contains("3-small", ignoreCase = true) -> {
+                        1536
+                    }
+
+                    else -> {
+                        logger.warn { "Unrecognized embedding model '$modelName'; using default dim $DEFAULT_EMBED_DIM" }
+                        DEFAULT_EMBED_DIM
+                    }
+                }
+            val ctx =
+                when {
+                    modelName.contains("3-large", ignoreCase = true) ||
+                        modelName.contains("3-small", ignoreCase = true) -> 8192
+
+                    else -> DEFAULT_EMBED_CTX
+                }
+            Triple("openai", dim, ctx)
         }
-    return dim to ctx
+    }
 }

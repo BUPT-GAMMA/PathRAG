@@ -8,13 +8,16 @@ import pathrag.base.BaseVectorStorage
 import pathrag.base.QueryParam
 import pathrag.base.runBlockingMaybe
 import pathrag.llm.defaultEmbeddingFunc
+import pathrag.llm.ollamaComplete
 import pathrag.llm.openAiComplete
 import pathrag.operate.chunkingByTokenSize
 import pathrag.operate.extractEntities
 import pathrag.operate.kgQuery
 import pathrag.storage.JsonKVStorage
 import pathrag.storage.NanoVectorDBStorage
+import pathrag.storage.Neo4jKVStorage
 import pathrag.storage.Neo4jStorage
+import pathrag.storage.Neo4jVectorStorage
 import pathrag.storage.NetworkXStorage
 import pathrag.utils.ResponseCache
 import pathrag.utils.computeMdHashId
@@ -59,21 +62,41 @@ class PathRAG(
         ),
 ) {
     private val logger = KotlinLogging.logger("PathRAG")
-    private val llmModelName: String = System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini"
+    private val llmProvider: String = System.getenv("LLM_PROVIDER")?.lowercase() ?: "openai"
+    private val llmModelName: String =
+        when (llmProvider) {
+            "ollama" -> System.getenv("OLLAMA_MODEL") ?: "llama3"
+            else -> System.getenv("OPENAI_MODEL") ?: "gpt-4o-mini"
+        }
 
     private val embeddingFunc = defaultEmbeddingFunc()
     private val llmModelFunc: suspend (String, String?, List<Map<String, String>>, Boolean, Boolean, Int?, Any?) -> String =
-        { prompt, system, history, keyword, stream, maxTokens, hashingKv ->
-            openAiComplete(
-                llmModelName,
-                prompt,
-                systemPrompt = system,
-                historyMessages = history,
-                keywordExtraction = keyword,
-                stream = stream,
-                maxTokens = maxTokens,
-                hashingKv = hashingKv,
-            )
+        when (llmProvider) {
+            "ollama" -> { prompt, system, history, keyword, stream, maxTokens, hashingKv ->
+                ollamaComplete(
+                    llmModelName,
+                    prompt,
+                    systemPrompt = system,
+                    historyMessages = history,
+                    keywordExtraction = keyword,
+                    stream = stream,
+                    maxTokens = maxTokens,
+                    hashingKv = hashingKv,
+                )
+            }
+
+            else -> { prompt, system, history, keyword, stream, maxTokens, hashingKv ->
+                openAiComplete(
+                    llmModelName,
+                    prompt,
+                    systemPrompt = system,
+                    historyMessages = history,
+                    keywordExtraction = keyword,
+                    stream = stream,
+                    maxTokens = maxTokens,
+                    hashingKv = hashingKv,
+                )
+            }
         }
 
     private val llmResponseCache = ResponseCache(globalConfig())
@@ -81,12 +104,14 @@ class PathRAG(
     private fun createKvStorage(namespace: String): BaseKVStorage<Map<String, Any>> =
         when (kvStorage) {
             "JsonKVStorage" -> JsonKVStorage(namespace, globalConfig(), embeddingFunc)
+            "Neo4jKVStorage" -> Neo4jKVStorage(namespace, globalConfig())
             else -> error("Unknown kv storage: $kvStorage")
         }
 
     private fun createVectorStorage(namespace: String): BaseVectorStorage =
         when (vectorStorage) {
             "NanoVectorDBStorage" -> NanoVectorDBStorage(namespace, globalConfig(), embeddingFunc)
+            "Neo4jVectorStorage" -> Neo4jVectorStorage(namespace, globalConfig(), embeddingFunc)
             else -> error("Unknown vector storage: $vectorStorage")
         }
 
@@ -202,7 +227,8 @@ class PathRAG(
                     "description" to (entity["description"] ?: "No description provided"),
                     "source_id" to (entity["source_id"] ?: "UNKNOWN"),
                 )
-            chunkEntityRelationGraph.upsertNode(name, nodeData)
+            runCatching { chunkEntityRelationGraph.upsertNode(name, nodeData) }
+                .onFailure { logger.error(it) { "Failed to upsert node $name" } }
         }
 
         relationships.forEach { rel ->
@@ -215,7 +241,8 @@ class PathRAG(
                     "keywords" to (rel["keywords"] ?: ""),
                     "source_id" to (rel["source_id"] ?: "UNKNOWN"),
                 )
-            chunkEntityRelationGraph.upsertEdge(src, tgt, data)
+            runCatching { chunkEntityRelationGraph.upsertEdge(src, tgt, data) }
+                .onFailure { logger.error(it) { "Failed to upsert edge $src -> $tgt" } }
         }
     }
 
@@ -254,5 +281,140 @@ class PathRAG(
         relationshipsVdb.deleteRelation(key)
         chunkEntityRelationGraph.deleteNode(key)
         logger.info { "Entity '$key' and relationships deleted." }
+    }
+
+    fun deleteEdge(
+        srcId: String,
+        tgtId: String,
+    ) = runBlockingMaybe { adeleteEdge(srcId, tgtId) }
+
+    suspend fun adeleteEdge(
+        srcId: String,
+        tgtId: String,
+    ) {
+        val srcKey = "\"${srcId.uppercase()}\""
+        val tgtKey = "\"${tgtId.uppercase()}\""
+        relationshipsVdb.deleteRelationBetween(srcKey, tgtKey)
+        chunkEntityRelationGraph.deleteEdge(srcKey, tgtKey)
+        logger.info { "Edge '$srcKey' -> '$tgtKey' deleted." }
+    }
+
+    fun cleanupGraph(): Map<String, Int> = runBlockingMaybe { acleanupGraph() }
+
+    suspend fun acleanupGraph(): Map<String, Int> {
+        var removedEdges = 0
+        var removedNodes = 0
+
+        val nodeSet = chunkEntityRelationGraph.nodes().toSet()
+        val danglingEdges = chunkEntityRelationGraph.edges().filter { (s, t) -> s !in nodeSet || t !in nodeSet }
+        danglingEdges.forEach { (s, t) ->
+            relationshipsVdb.deleteRelationBetween(s, t)
+            chunkEntityRelationGraph.deleteEdge(s, t)
+            removedEdges += 1
+        }
+
+        val nodes = chunkEntityRelationGraph.nodes()
+        val isolated =
+            nodes.filter { node ->
+                chunkEntityRelationGraph.nodeDegree(node) == 0
+            }
+        isolated.forEach { node ->
+            entitiesVdb.deleteEntity(node)
+            relationshipsVdb.deleteRelation(node)
+            chunkEntityRelationGraph.deleteNode(node)
+            removedNodes += 1
+        }
+
+        logger.info { "Graph cleanup removed $removedEdges dangling edges and $removedNodes isolated nodes." }
+        return mapOf("removed_edges" to removedEdges, "removed_nodes" to removedNodes)
+    }
+
+    fun dropGraph() = runBlockingMaybe { adropGraph() }
+
+    suspend fun adropGraph() {
+        chunkEntityRelationGraph.drop()
+        entitiesVdb.drop()
+        relationshipsVdb.drop()
+        logger.info { "Graph and associated entity/relationship vectors dropped." }
+    }
+
+    fun upsertEntity(
+        entityName: String,
+        description: String = "",
+        entityType: String = "UNKNOWN",
+        sourceId: String? = null,
+    ) = runBlockingMaybe { aupsertEntity(entityName, description, entityType, sourceId) }
+
+    suspend fun aupsertEntity(
+        entityName: String,
+        description: String = "",
+        entityType: String = "UNKNOWN",
+        sourceId: String? = null,
+    ) {
+        val key = "\"${entityName.trim('"').uppercase()}\""
+        val nodeData =
+            mapOf(
+                "entity_type" to entityType,
+                "description" to description,
+                "source_id" to (sourceId ?: "UNKNOWN"),
+                "entity_name" to key,
+            )
+        val vectorId = computeMdHashId(key, prefix = "ent-")
+        chunkEntityRelationGraph.upsertNode(key, nodeData)
+        entitiesVdb.upsert(
+            mapOf(
+                vectorId to
+                    mapOf(
+                        "content" to description,
+                        "entity_name" to key,
+                        "source_id" to (sourceId ?: ""),
+                    ),
+            ),
+        )
+        logger.info { "Entity '$key' upserted." }
+    }
+
+    fun upsertEdge(
+        srcId: String,
+        tgtId: String,
+        description: String = "",
+        keywords: String = "",
+        weight: Double = 1.0,
+        sourceId: String? = null,
+    ) = runBlockingMaybe { aupsertEdge(srcId, tgtId, description, keywords, weight, sourceId) }
+
+    suspend fun aupsertEdge(
+        srcId: String,
+        tgtId: String,
+        description: String = "",
+        keywords: String = "",
+        weight: Double = 1.0,
+        sourceId: String? = null,
+    ) {
+        val srcKey = "\"${srcId.trim('"').uppercase()}\""
+        val tgtKey = "\"${tgtId.trim('"').uppercase()}\""
+        val data =
+            mapOf(
+                "weight" to weight,
+                "description" to description,
+                "keywords" to keywords,
+                "source_id" to (sourceId ?: "UNKNOWN"),
+            )
+        chunkEntityRelationGraph.upsertEdge(srcKey, tgtKey, data)
+        val relId = computeMdHashId(srcKey + tgtKey, prefix = "rel-")
+        relationshipsVdb.upsert(
+            mapOf(
+                relId to
+                    mapOf(
+                        "src_id" to srcKey,
+                        "tgt_id" to tgtKey,
+                        "content" to (description + keywords),
+                        "keywords" to keywords,
+                        "description" to description,
+                        "source_id" to (sourceId ?: ""),
+                    ),
+            ),
+        )
+        logger.info { "Edge '$srcKey' -> '$tgtKey' upserted." }
     }
 }

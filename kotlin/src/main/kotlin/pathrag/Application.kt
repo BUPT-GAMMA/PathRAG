@@ -38,12 +38,17 @@ import kotlinx.serialization.json.Json
 import pathrag.PathRAG
 import pathrag.base.QueryParam
 import java.io.File
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.Base64
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 private val logger = KotlinLogging.logger("pathrag")
 
@@ -150,29 +155,35 @@ class UserRepository(
             prettyPrint = true
             ignoreUnknownKeys = true
         }
+    private var initialized = false
 
-    init {
-        runBlocking { load() }
+    suspend fun count(): Int {
+        ensureLoaded()
+        return mutex.withLock { users.size }
     }
 
-    suspend fun count(): Int = mutex.withLock { users.size }
-
-    suspend fun add(user: User): User =
-        mutex.withLock {
+    suspend fun add(user: User): User {
+        ensureLoaded()
+        return mutex.withLock {
             val stored =
                 if (user.id == null) user.copy(id = nextId++) else user.copy(id = user.id)
             users.add(stored)
             persist()
             stored
         }
+    }
 
-    suspend fun find(username: String): User? = mutex.withLock { users.find { it.username == username } }
+    suspend fun find(username: String): User? {
+        ensureLoaded()
+        return mutex.withLock { users.find { it.username == username } }
+    }
 
     suspend fun updateTheme(
         username: String,
         theme: String,
-    ): User? =
-        mutex.withLock {
+    ): User? {
+        ensureLoaded()
+        return mutex.withLock {
             val idx = users.indexOfFirst { it.username == username }
             if (idx == -1) return@withLock null
             val updated = users[idx].copy(theme = theme, updatedAt = Instant.now().toString())
@@ -180,22 +191,34 @@ class UserRepository(
             persist()
             updated
         }
+    }
 
-    suspend fun list(): List<User> = mutex.withLock { users.toList() }
+    suspend fun list(): List<User> {
+        ensureLoaded()
+        return mutex.withLock { users.toList() }
+    }
 
-    private suspend fun load() {
-        val file = filePath?.toFile() ?: return
-        if (!file.exists()) return
+    suspend fun ensureLoaded() {
+        if (initialized) return
+        val file = filePath?.toFile()
         val parsed =
-            withContext(Dispatchers.IO) {
-                runCatching { json.decodeFromString<List<User>>(file.readText()) }
-                    .onFailure { ex -> logger.warn(ex) { "Failed to load users from ${file.absolutePath}" } }
-                    .getOrNull()
-            } ?: return
+            if (file != null && file.exists()) {
+                withContext(Dispatchers.IO) {
+                    runCatching { json.decodeFromString<List<User>>(file.readText()) }
+                        .onFailure { ex -> logger.warn(ex) { "Failed to load users from ${file.absolutePath}" } }
+                        .getOrNull()
+                }
+            } else {
+                emptyList()
+            }
         mutex.withLock {
-            users.clear()
-            users.addAll(parsed)
-            nextId = (users.maxOfOrNull { it.id ?: 0 } ?: 0) + 1
+            if (initialized) return
+            if (parsed != null && parsed.isNotEmpty()) {
+                users.clear()
+                users.addAll(parsed)
+                nextId = (users.maxOfOrNull { it.id ?: 0 } ?: 0) + 1
+            }
+            initialized = true
         }
     }
 
@@ -270,6 +293,39 @@ object PasswordHasher {
     }
 }
 
+object TokenService {
+    private val secret: ByteArray =
+        (System.getenv("SECRET_KEY") ?: UUID.randomUUID().toString()).toByteArray(StandardCharsets.UTF_8)
+    private val encoder = Base64.getUrlEncoder().withoutPadding()
+    private val decoder = Base64.getUrlDecoder()
+
+    fun issueToken(username: String): String {
+        val nonce = UUID.randomUUID().toString()
+        val payload = "$username:$nonce:${Instant.now()}"
+        val signature = hmacSha256(payload.toByteArray(StandardCharsets.UTF_8))
+        return "${encoder.encodeToString(payload.toByteArray(StandardCharsets.UTF_8))}.${encoder.encodeToString(signature)}"
+    }
+
+    fun usernameFromToken(token: String?): String? {
+        val parts = token?.split(".") ?: return null
+        if (parts.size != 2) return null
+        val payloadBytes =
+            runCatching { decoder.decode(parts[0]) }.getOrElse { return null }
+        val providedSignature =
+            runCatching { decoder.decode(parts[1]) }.getOrElse { return null }
+        val expected = hmacSha256(payloadBytes)
+        if (!expected.contentEquals(providedSignature)) return null
+        val payload = payloadBytes.toString(StandardCharsets.UTF_8)
+        return payload.substringBefore(":")
+    }
+
+    private fun hmacSha256(data: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(secret, "HmacSHA256"))
+        return mac.doFinal(data)
+    }
+}
+
 @Serializable
 private data class LoginRequest(
     val username: String,
@@ -337,20 +393,26 @@ class ChatRepository(
             prettyPrint = true
             ignoreUnknownKeys = true
         }
+    private var initialized = false
 
-    init {
-        runBlocking { load() }
+    suspend fun allThreads(): List<ChatThread> {
+        ensureLoaded()
+        return mutex.withLock { threads.values.toList() }
     }
 
-    suspend fun allThreads(): List<ChatThread> = mutex.withLock { threads.values.toList() }
+    suspend fun recentThreads(limit: Int = 5): List<ChatThread> {
+        ensureLoaded()
+        return mutex.withLock { threads.values.sortedByDescending { it.updatedAt }.take(limit) }
+    }
 
-    suspend fun recentThreads(limit: Int = 5): List<ChatThread> =
-        mutex.withLock { threads.values.sortedByDescending { it.updatedAt }.take(limit) }
+    suspend fun thread(id: String): ChatThread? {
+        ensureLoaded()
+        return mutex.withLock { threads[id] }
+    }
 
-    suspend fun thread(id: String): ChatThread? = mutex.withLock { threads[id] }
-
-    suspend fun addThread(title: String): ChatThread =
-        mutex.withLock {
+    suspend fun addThread(title: String): ChatThread {
+        ensureLoaded()
+        return mutex.withLock {
             val uuid =
                 java.util.UUID
                     .randomUUID()
@@ -366,34 +428,40 @@ class ChatRepository(
             persist()
             thread
         }
+    }
 
     suspend fun updateThreadTitle(
         id: String,
         title: String,
-    ): ChatThread? =
-        mutex.withLock {
+    ): ChatThread? {
+        ensureLoaded()
+        return mutex.withLock {
             val current = threads[id] ?: return@withLock null
             val updated = current.copy(title = title, updatedAt = Instant.now().toString())
             threads[id] = updated
             persist()
             updated
         }
+    }
 
-    suspend fun markDeleted(id: String): ChatThread? =
-        mutex.withLock {
+    suspend fun markDeleted(id: String): ChatThread? {
+        ensureLoaded()
+        return mutex.withLock {
             val current = threads[id] ?: return@withLock null
             val updated = current.copy(isDeleted = true, updatedAt = Instant.now().toString())
             threads[id] = updated
             persist()
             updated
         }
+    }
 
     suspend fun addChat(
         threadId: String,
         content: String,
         sender: String = "user",
-    ): ChatMessage? =
-        mutex.withLock {
+    ): ChatMessage? {
+        ensureLoaded()
+        return mutex.withLock {
             val current = threads[threadId] ?: return@withLock null
             val message =
                 ChatMessage(
@@ -412,23 +480,32 @@ class ChatRepository(
             persist()
             message
         }
+    }
 
-    private suspend fun load() {
-        val file = filePath?.toFile() ?: return
-        if (!file.exists()) return
+    private suspend fun ensureLoaded() {
+        if (initialized) return
+        val file = filePath?.toFile()
         val parsed =
-            withContext(Dispatchers.IO) {
-                runCatching { json.decodeFromString<List<ChatThread>>(file.readText()) }
-                    .onFailure { ex -> logger.warn(ex) { "Failed to load chats from ${file.absolutePath}" } }
-                    .getOrNull()
-            } ?: return
+            if (file != null && file.exists()) {
+                withContext(Dispatchers.IO) {
+                    runCatching { json.decodeFromString<List<ChatThread>>(file.readText()) }
+                        .onFailure { ex -> logger.warn(ex) { "Failed to load chats from ${file.absolutePath}" } }
+                        .getOrNull()
+                }
+            } else {
+                emptyList()
+            }
         mutex.withLock {
-            threads.clear()
-            parsed.forEach { threads[it.uuid] = it }
-            nextThreadId = (parsed.maxOfOrNull { it.id } ?: 0) + 1
-            val maxMsgId =
-                parsed.flatMap { it.chats }.maxOfOrNull { it.id } ?: 0
-            nextMessageId = maxMsgId + 1
+            if (initialized) return
+            if (parsed != null && parsed.isNotEmpty()) {
+                threads.clear()
+                parsed.forEach { threads[it.uuid] = it }
+                nextThreadId = (parsed.maxOfOrNull { it.id } ?: 0) + 1
+                val maxMsgId =
+                    parsed.flatMap { it.chats }.maxOfOrNull { it.id } ?: 0
+                nextMessageId = maxMsgId + 1
+            }
+            initialized = true
         }
     }
 
@@ -457,22 +534,26 @@ class DocumentRepository(
             prettyPrint = true
             ignoreUnknownKeys = true
         }
+    private var initialized = false
 
-    init {
-        runBlocking { load() }
+    suspend fun all(): List<DocumentInfo> {
+        ensureLoaded()
+        return mutex.withLock { documents.values.toList() }
     }
 
-    suspend fun all(): List<DocumentInfo> = mutex.withLock { documents.values.toList() }
-
-    suspend fun get(id: Int): DocumentInfo? = mutex.withLock { documents[id] }
+    suspend fun get(id: Int): DocumentInfo? {
+        ensureLoaded()
+        return mutex.withLock { documents[id] }
+    }
 
     suspend fun add(
         name: String,
         content: String,
         contentType: String = "text/plain",
         userId: Int = 1,
-    ): DocumentInfo =
-        mutex.withLock {
+    ): DocumentInfo {
+        ensureLoaded()
+        return mutex.withLock {
             val id = nextId++
             val filePath = File(uploadDir, "${id}_$name").absolutePath
             val info =
@@ -489,8 +570,12 @@ class DocumentRepository(
             persist()
             info
         }
+    }
 
-    suspend fun status(id: Int): String = mutex.withLock { documents[id]?.status ?: "unknown" }
+    suspend fun status(id: Int): String {
+        ensureLoaded()
+        return mutex.withLock { documents[id]?.status ?: "unknown" }
+    }
 
     private suspend fun saveToDisk(
         path: String,
@@ -505,19 +590,27 @@ class DocumentRepository(
         }
     }
 
-    private suspend fun load() {
-        val file = filePath?.toFile() ?: return
-        if (!file.exists()) return
+    private suspend fun ensureLoaded() {
+        if (initialized) return
+        val file = filePath?.toFile()
         val parsed =
-            withContext(Dispatchers.IO) {
-                runCatching { json.decodeFromString<List<DocumentInfo>>(file.readText()) }
-                    .onFailure { ex -> logger.warn(ex) { "Failed to load documents from ${file.absolutePath}" } }
-                    .getOrNull()
-            } ?: return
+            if (file != null && file.exists()) {
+                withContext(Dispatchers.IO) {
+                    runCatching { json.decodeFromString<List<DocumentInfo>>(file.readText()) }
+                        .onFailure { ex -> logger.warn(ex) { "Failed to load documents from ${file.absolutePath}" } }
+                        .getOrNull()
+                }
+            } else {
+                emptyList()
+            }
         mutex.withLock {
-            documents.clear()
-            parsed.forEach { documents[it.id] = it }
-            nextId = (documents.keys.maxOrNull() ?: 0) + 1
+            if (initialized) return
+            if (parsed != null && parsed.isNotEmpty()) {
+                documents.clear()
+                parsed.forEach { documents[it.id] = it }
+                nextId = (documents.keys.maxOrNull() ?: 0) + 1
+            }
+            initialized = true
         }
     }
 
@@ -545,7 +638,7 @@ private fun Route.authRoutes(repository: UserRepository) {
         if (user == null || user.hashedPassword != PasswordHasher.hash(req.password)) {
             call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid credentials"))
         } else {
-            call.respond(mapOf("access_token" to "token-${user.username}", "token_type" to "bearer"))
+            call.respond(mapOf("access_token" to TokenService.issueToken(user.username), "token_type" to "bearer"))
         }
     }
     post("/register") {
@@ -566,7 +659,14 @@ private fun Route.authRoutes(repository: UserRepository) {
         }
     }
     get("/users/me") {
-        val current = repository.list().firstOrNull()
+        val authHeader = call.request.headers[HttpHeaders.Authorization]
+        val token = authHeader?.removePrefix("Bearer")?.trim()
+        val username = TokenService.usernameFromToken(token)
+        if (username == null) {
+            call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
+            return@get
+        }
+        val current = repository.find(username)
         if (current == null) call.respond(HttpStatusCode.NotFound) else call.respond(current)
     }
 }

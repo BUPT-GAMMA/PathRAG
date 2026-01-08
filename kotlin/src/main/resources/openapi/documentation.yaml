@@ -335,10 +335,12 @@ components:
       properties:
         nodes:
           type: array
+          maxItems: 500
           items:
             $ref: '#/components/schemas/GraphNodeDto'
         edges:
           type: array
+          maxItems: 2000
           items:
             $ref: '#/components/schemas/GraphEdgeDto'
       required: [nodes, edges]

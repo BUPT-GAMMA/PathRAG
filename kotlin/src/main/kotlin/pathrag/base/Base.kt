@@ -37,6 +37,13 @@ abstract class BaseVectorStorage(
     open suspend fun deleteEntity(entityName: String) {}
 
     open suspend fun deleteRelation(entityName: String) {}
+
+    open suspend fun deleteRelationBetween(
+        srcId: String,
+        tgtId: String,
+    ) {}
+
+    open suspend fun drop() {}
 }
 
 abstract class BaseKVStorage<T>(
@@ -103,6 +110,11 @@ abstract class BaseGraphStorage(
         edgeData: Map<String, Any?>,
     )
 
+    abstract suspend fun deleteEdge(
+        sourceNodeId: String,
+        targetNodeId: String,
+    )
+
     abstract suspend fun deleteNode(nodeId: String)
 
     open suspend fun embedNodes(algorithm: String): Pair<DoubleArray, List<String>> =
@@ -111,6 +123,8 @@ abstract class BaseGraphStorage(
     open suspend fun nodes(): List<String> = emptyList()
 
     open suspend fun edges(): List<Pair<String, String>> = emptyList()
+
+    open suspend fun drop() {}
 }
 
 /**
