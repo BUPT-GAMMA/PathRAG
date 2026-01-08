@@ -1,0 +1,345 @@
+openapi: 3.0.3
+info:
+  title: PathRAG API
+  version: "1.0.0"
+paths:
+  /token:
+    post:
+      summary: Login and get access token
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        "200":
+          description: OK
+  /register:
+    post:
+      summary: Register a new user
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        "200":
+          description: OK
+  /users/me:
+    get:
+      summary: Get current user information
+      tags: [Authentication]
+      responses:
+        "200":
+          description: OK
+  /users/:
+    get:
+      summary: Get all users
+      tags: [Users]
+      responses:
+        "200":
+          description: OK
+  /users/theme:
+    post:
+      summary: Update user theme
+      tags: [Users]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ThemeRequest'
+      responses:
+        "200":
+          description: OK
+  /chats/:
+    get:
+      summary: Get all chats
+      tags: [Chats]
+      responses:
+        "200":
+          description: OK
+  /chats/recent:
+    get:
+      summary: Get the 5 most recent chat threads
+      tags: [Chat Threads]
+      responses:
+        "200":
+          description: OK
+  /chats/threads:
+    get:
+      summary: Get all chat threads
+      tags: [Chat Threads]
+      responses:
+        "200":
+          description: OK
+    post:
+      summary: Create a new chat thread
+      tags: [Chat Threads]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateThreadRequest'
+      responses:
+        "200":
+          description: OK
+  /chats/threads/{thread_uuid}:
+    parameters:
+      - name: thread_uuid
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Get a specific thread with all its chats
+      tags: [Chat Threads]
+      responses:
+        "200":
+          description: OK
+    put:
+      summary: Update a thread's title
+      tags: [Chat Threads]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateThreadRequest'
+      responses:
+        "200":
+          description: OK
+    delete:
+      summary: Mark a thread as deleted
+      tags: [Chat Threads]
+      responses:
+        "200":
+          description: OK
+  /chats/chat/{thread_uuid}:
+    parameters:
+      - name: thread_uuid
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Create a new chat message in a thread
+      tags: [Chats]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateChatRequest'
+      responses:
+        "200":
+          description: OK
+  /documents/:
+    get:
+      summary: Get all documents
+      tags: [Documents]
+      responses:
+        "200":
+          description: OK
+  /documents/upload:
+    post:
+      summary: Upload a document
+      tags: [Documents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadDocumentRequest'
+      responses:
+        "200":
+          description: OK
+  /documents/query:
+    post:
+      summary: Query PathRAG
+      tags: [Documents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  answer:
+                    type: string
+  /documents/{document_id}:
+    parameters:
+      - name: document_id
+        in: path
+        required: true
+        schema:
+          type: integer
+    get:
+      summary: Get a specific document
+      tags: [Documents]
+      responses:
+        "200":
+          description: OK
+  /documents/{document_id}/status:
+    parameters:
+      - name: document_id
+        in: path
+        required: true
+        schema:
+          type: integer
+    get:
+      summary: Get document processing status
+      tags: [Documents]
+      responses:
+        "200":
+          description: OK
+  /documents/reload:
+    post:
+      summary: Reload the PathRAG instance to recognize new documents
+      tags: [Documents]
+      responses:
+        "200":
+          description: OK
+  /knowledge-graph/:
+    get:
+      summary: Get the knowledge graph
+      tags: [Knowledge Graph]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphResponse'
+  /knowledge-graph/query:
+    post:
+      summary: Query the knowledge graph
+      tags: [Knowledge Graph]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+              required: [query]
+      responses:
+        "200":
+          description: OK
+components:
+components:
+  schemas:
+    LoginRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+      required: [username, password]
+    RegisterRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        email:
+          type: string
+        password:
+          type: string
+      required: [username, email, password]
+    ThemeRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        theme:
+          type: string
+      required: [username, theme]
+    CreateThreadRequest:
+      type: object
+      properties:
+        title:
+          type: string
+      required: [title]
+    UpdateThreadRequest:
+      type: object
+      properties:
+        title:
+          type: string
+      required: [title]
+    CreateChatRequest:
+      type: object
+      properties:
+        content:
+          type: string
+        sender:
+          type: string
+      required: [content]
+    UploadDocumentRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        content:
+          type: string
+        contentType:
+          type: string
+        userId:
+          type: integer
+      required: [name, content]
+    QueryRequest:
+      type: object
+      properties:
+        query:
+          type: string
+        mode:
+          type: string
+      required: [query]
+    GraphNodeDto:
+      type: object
+      properties:
+        id:
+          type: string
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+      required: [id, properties]
+    GraphEdgeDto:
+      type: object
+      properties:
+        source:
+          type: string
+        target:
+          type: string
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+      required: [source, target, properties]
+    GraphResponse:
+      type: object
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphNodeDto'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphEdgeDto'
+      required: [nodes, edges]

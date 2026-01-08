@@ -123,6 +123,8 @@ class PathRAG(
 
     fun insert(stringOrStrings: Any) = runBlockingMaybe { ainsert(stringOrStrings) }
 
+    fun graph(): BaseGraphStorage = chunkEntityRelationGraph
+
     suspend fun ainsert(stringOrStrings: Any) {
         val inputs =
             when (stringOrStrings) {
