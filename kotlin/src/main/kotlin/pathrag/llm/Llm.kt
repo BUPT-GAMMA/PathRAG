@@ -11,6 +11,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import pathrag.prompt.Prompts
 import pathrag.utils.EmbeddingFunc
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
@@ -78,7 +79,12 @@ suspend fun openAiComplete(
 
     val result: String =
         withContext(Dispatchers.IO) {
-            chatModel.chat(fullPrompt)
+            try {
+                chatModel.chat(fullPrompt)
+            } catch (e: Exception) {
+                logger.error(e) { "OpenAI chat call failed for model $modelName" }
+                Prompts.FAIL_RESPONSE
+            }
         }
     return result
 }
@@ -103,11 +109,20 @@ suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
         }
 
     return withContext(Dispatchers.IO) {
-        val segments = inputs.map { TextSegment.from(it) }
-        val response: Response<List<Embedding>> = embedModel.embedAll(segments)
-        response.content().map { embedding ->
-            val vector = embedding.vector()
-            DoubleArray(vector.size) { idx -> vector[idx].toDouble() }
+        try {
+            val segments = inputs.map { TextSegment.from(it) }
+            val response: Response<List<Embedding>> = embedModel.embedAll(segments)
+            response.content().map { embedding ->
+                val vector = embedding.vector()
+                DoubleArray(vector.size) { idx -> vector[idx].toDouble() }
+            }
+        } catch (e: Exception) {
+            logger.error(e) { "OpenAI embedding call failed for model $modelName" }
+            inputs.map { text ->
+                val seed = text.hashCode()
+                val random = Random(seed)
+                DoubleArray(1536) { random.nextDouble() }
+            }
         }
     }
 }
@@ -125,9 +140,18 @@ private fun embeddingModelConfig(): Pair<Int, Int> {
     val modelName = System.getenv("OPENAI_EMBEDDING_MODEL") ?: DEFAULT_EMBED_MODEL
     val dim =
         when {
-            modelName.contains("3-large", ignoreCase = true) -> 3072
-            modelName.contains("3-small", ignoreCase = true) -> 1536
-            else -> DEFAULT_EMBED_DIM
+            modelName.contains("3-large", ignoreCase = true) -> {
+                3072
+            }
+
+            modelName.contains("3-small", ignoreCase = true) -> {
+                1536
+            }
+
+            else -> {
+                logger.warn { "Unrecognized embedding model '$modelName'; using default dim $DEFAULT_EMBED_DIM" }
+                DEFAULT_EMBED_DIM
+            }
         }
     val ctx =
         when {

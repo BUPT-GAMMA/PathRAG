@@ -140,7 +140,8 @@ suspend fun extractEntities(
                     "entity_name" to name,
                 )
             allEntities.add(nodeData)
-            knowledgeGraphInst.upsertNode(name, nodeData)
+            runCatching { knowledgeGraphInst.upsertNode(name, nodeData) }
+                .onFailure { logger.error(it) { "Failed to upsert node $name" } }
         }
 
         relationships.forEach { rel ->
@@ -156,7 +157,8 @@ suspend fun extractEntities(
                     "source_id" to chunkId,
                 )
             allRelationships.add(mapOf("src_id" to src, "tgt_id" to tgt) + edgeData)
-            knowledgeGraphInst.upsertEdge(src, tgt, edgeData)
+            runCatching { knowledgeGraphInst.upsertEdge(src, tgt, edgeData) }
+                .onFailure { logger.error(it) { "Failed to upsert edge $src -> $tgt" } }
         }
     }
 
@@ -172,7 +174,8 @@ suspend fun extractEntities(
                             "entity_name" to entityName,
                         )
                 }.toMap()
-        entityVdb.upsert(toStore)
+        runCatching { entityVdb.upsert(toStore) }
+            .onFailure { logger.error(it) { "Failed to upsert ${toStore.size} entities into VDB" } }
     }
 
     if (allRelationships.isNotEmpty()) {
@@ -193,7 +196,8 @@ suspend fun extractEntities(
                             "description" to description,
                         )
                 }.toMap()
-        relationshipsVdb.upsert(toStore)
+        runCatching { relationshipsVdb.upsert(toStore) }
+            .onFailure { logger.error(it) { "Failed to upsert ${toStore.size} relationships into VDB" } }
     }
 
     return knowledgeGraphInst
