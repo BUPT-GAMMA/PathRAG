@@ -18,6 +18,8 @@ import kotlin.random.Random
 private val logger = KotlinLogging.logger("PathRAG-LLM")
 private const val DEFAULT_CHAT_MODEL = "gpt-4o-mini"
 private const val DEFAULT_EMBED_MODEL = "text-embedding-3-small"
+private const val DEFAULT_EMBED_DIM = 1536
+private const val DEFAULT_EMBED_CTX = 8192
 
 private val chatModels = ConcurrentHashMap<String, ChatModel>()
 private val embeddingModels = ConcurrentHashMap<String, EmbeddingModel>()
@@ -44,11 +46,19 @@ suspend fun openAiComplete(
         }
     }
 
+    val logRequests = System.getenv("OPENAI_LOG_REQUESTS")?.toBoolean() ?: false
+    val logResponses = System.getenv("OPENAI_LOG_RESPONSES")?.toBoolean() ?: false
     val baseUrl = System.getenv("OPENAI_API_BASE")
     val modelName = model.ifBlank { DEFAULT_CHAT_MODEL }
     val chatModel: ChatModel =
         chatModels.computeIfAbsent("$modelName|$baseUrl") {
-            val builder = OpenAiChatModel.builder().apiKey(apiKey).modelName(modelName)
+            val builder =
+                OpenAiChatModel
+                    .builder()
+                    .apiKey(apiKey)
+                    .logRequests(logRequests)
+                    .logResponses(logResponses)
+                    .modelName(modelName)
             baseUrl?.takeIf { it.isNotBlank() }?.let { builder.baseUrl(it) }
             builder.build()
         }
@@ -103,8 +113,28 @@ suspend fun openAiEmbedding(inputs: List<String>): List<DoubleArray> {
 }
 
 fun defaultEmbeddingFunc(): EmbeddingFunc =
-    EmbeddingFunc(
-        embeddingDim = 1536,
-        maxTokenSize = 4096,
-        func = ::openAiEmbedding,
-    )
+    embeddingModelConfig().let { (dim, ctx) ->
+        EmbeddingFunc(
+            embeddingDim = dim,
+            maxTokenSize = ctx,
+            func = ::openAiEmbedding,
+        )
+    }
+
+private fun embeddingModelConfig(): Pair<Int, Int> {
+    val modelName = System.getenv("OPENAI_EMBEDDING_MODEL") ?: DEFAULT_EMBED_MODEL
+    val dim =
+        when {
+            modelName.contains("3-large", ignoreCase = true) -> 3072
+            modelName.contains("3-small", ignoreCase = true) -> 1536
+            else -> DEFAULT_EMBED_DIM
+        }
+    val ctx =
+        when {
+            modelName.contains("3-large", ignoreCase = true) ||
+                modelName.contains("3-small", ignoreCase = true) -> 8192
+
+            else -> DEFAULT_EMBED_CTX
+        }
+    return dim to ctx
+}

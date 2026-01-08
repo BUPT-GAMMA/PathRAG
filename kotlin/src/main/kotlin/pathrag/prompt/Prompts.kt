@@ -27,4 +27,17 @@ Examples:
 Output keys: "high_level_keywords" and "low_level_keywords".
 The Output should be human text, not unicode characters. Keep the same language as Query.
 """
+
+    const val ENTITY_REL_JSON = """
+Extract entities and relationships from the given text and return strict JSON.
+Rules:
+- Entities: produce array under "entities" with objects { "entity_name": string, "entity_type": string, "description": string }
+- Relationships: produce array under "relationships" with objects { "src_id": string, "tgt_id": string, "description": string, "keywords": string, "weight": number }
+- Use uppercase for entity_name/src_id/tgt_id and wrap names in quotes (e.g., "LONDON")
+- Keep descriptions concise (<= 200 chars)
+- Respond with ONLY JSON, no extra text.
+
+Text:
+{text}
+"""
 }
