@@ -465,6 +465,8 @@ private suspend fun buildPathRelations(
     if (targetNodes.size < 2) return emptyList()
 
     val paths = findPathsBetweenTargets(knowledgeGraphInst, targetNodes, maxDepth = 3)
+    val weightedPaths = scorePaths(paths, knowledgeGraphInst).take(15)
+    val selectedPaths = weightedPaths.map { it.first }
     if (paths.isEmpty()) return emptyList()
 
     val nodesCache = mutableMapOf<String, Map<String, Any?>>()
@@ -492,7 +494,7 @@ private suspend fun buildPathRelations(
     }
 
     val described = mutableListOf<String>()
-    for (path in paths.sortedBy { it.size }) {
+    for (path in selectedPaths.sortedBy { it.size }) {
         described.add(describePath(path))
     }
 
@@ -540,6 +542,41 @@ private suspend fun findPathsBetweenTargets(
     }
 
     return results.toList()
+}
+
+private suspend fun scorePaths(
+    paths: List<List<String>>,
+    knowledgeGraphInst: BaseGraphStorage,
+): List<Pair<List<String>, Double>> {
+    suspend fun edgeWeight(
+        u: String,
+        v: String,
+    ): Double {
+        val edge = knowledgeGraphInst.getEdge(u, v) ?: knowledgeGraphInst.getEdge(v, u)
+        val weight = (edge?.get("weight") as? Number)?.toDouble() ?: 1.0
+        val degree = knowledgeGraphInst.edgeDegree(u, v).toDouble()
+        return weight + degree
+    }
+
+    suspend fun pathScore(path: List<String>): Double {
+        if (path.size < 2) return 0.0
+        val pageranks = path.map { knowledgeGraphInst.getPagerank(it) }
+        val avgPagerank = pageranks.average()
+
+        var edgeSum = 0.0
+        for (i in 0 until path.lastIndex) {
+            edgeSum += edgeWeight(path[i], path[i + 1])
+        }
+        val edgeAvg = edgeSum / (path.size - 1)
+        return avgPagerank + edgeAvg
+    }
+
+    val scored = mutableListOf<Pair<List<String>, Double>>()
+    for (p in paths) {
+        val score = pathScore(p)
+        scored.add(p to score)
+    }
+    return scored.sortedByDescending { it.second }
 }
 
 private suspend fun runGlobalMode(
