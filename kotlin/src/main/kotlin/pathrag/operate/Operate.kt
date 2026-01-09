@@ -221,7 +221,7 @@ private fun extractJsonPayload(response: String): String {
     return trimmed
 }
 
-private fun normalizeId(id: String): String = "\"${id.trim('"').uppercase()}\""
+private fun normalizeId(id: String): String = id.trim('"').uppercase()
 
 suspend fun kgQuery(
     query: String,

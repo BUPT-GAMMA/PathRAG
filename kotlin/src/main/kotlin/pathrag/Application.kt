@@ -5,8 +5,10 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.content.PartData
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
 import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
@@ -16,6 +18,7 @@ import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.cors.routing.CORS
 import io.ktor.server.plugins.swagger.swaggerUI
 import io.ktor.server.request.receive
+import io.ktor.server.request.receiveMultipart
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondRedirect
 import io.ktor.server.routing.Route
@@ -25,6 +28,7 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.put
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
+import io.ktor.utils.io.core.readBytes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -122,6 +126,7 @@ fun Application.module(env: EnvironmentConfig = EnvironmentConfig.empty()) {
     val documentRepository = DocumentRepository(uploadDir, Paths.get(workingDir, "documents.json"))
     TokenService.configure(env)
     runBlocking { createDefaultUsers(userRepository) }
+    runBlocking { preloadKnowledgeGraphIfEmpty(rag, documentRepository) }
 
     routing {
         get("/") { call.respondRedirect("/swagger") }
@@ -130,8 +135,8 @@ fun Application.module(env: EnvironmentConfig = EnvironmentConfig.empty()) {
         get("/app") { call.respondRedirect("/ui/index.html") }
         authRoutes(userRepository)
         userRoutes(userRepository)
-        chatRoutes(chatRepository)
-        documentRoutes(documentRepository, rag)
+        chatRoutes(userRepository, chatRepository)
+        documentRoutes(documentRepository, rag, userRepository)
         knowledgeGraphRoutes(rag)
         // query endpoint relocated under /documents/query
     }
@@ -504,7 +509,10 @@ class ChatRepository(
         return mutex.withLock { threads[id] }
     }
 
-    suspend fun addThread(title: String): ChatThread {
+    suspend fun addThread(
+        title: String,
+        userId: Int,
+    ): ChatThread {
         ensureLoaded()
         return mutex.withLock {
             val uuid =
@@ -515,7 +523,7 @@ class ChatRepository(
                 ChatThread(
                     id = nextThreadId++,
                     uuid = uuid,
-                    userId = 1,
+                    userId = userId,
                     title = title,
                 )
             threads[uuid] = thread
@@ -553,6 +561,7 @@ class ChatRepository(
         threadId: String,
         content: String,
         sender: String = "user",
+        userId: Int,
     ): ChatMessage? {
         ensureLoaded()
         return mutex.withLock {
@@ -561,7 +570,7 @@ class ChatRepository(
                 ChatMessage(
                     id = nextMessageId++,
                     threadId = current.id,
-                    userId = 1,
+                    userId = userId,
                     role = sender,
                     message = content,
                 )
@@ -660,9 +669,37 @@ class DocumentRepository(
                     contentType = contentType,
                     filePath = filePath,
                     fileSize = content.toByteArray().size.toLong(),
+                    status = "processing",
                 )
             documents[id] = info
             saveToDisk(filePath, content)
+            persist()
+            info
+        }
+    }
+
+    suspend fun addFile(
+        name: String,
+        data: ByteArray,
+        contentType: String? = null,
+        userId: Int = 1,
+    ): DocumentInfo {
+        ensureLoaded()
+        return mutex.withLock {
+            val id = nextId++
+            val path = File(uploadDir, "${id}_$name").absolutePath
+            val info =
+                DocumentInfo(
+                    id = id,
+                    userId = userId,
+                    filename = name,
+                    contentType = contentType ?: "application/octet-stream",
+                    filePath = path,
+                    fileSize = data.size.toLong(),
+                    status = "processing",
+                )
+            documents[id] = info
+            saveBytes(path, data)
             persist()
             info
         }
@@ -673,6 +710,27 @@ class DocumentRepository(
         return mutex.withLock { documents[id]?.status ?: "unknown" }
     }
 
+    suspend fun markProcessed(id: Int) {
+        ensureLoaded()
+        mutex.withLock {
+            val current = documents[id] ?: return@withLock
+            documents[id] = current.copy(status = "processed", processedAt = Instant.now().toString(), errorMessage = null)
+            persist()
+        }
+    }
+
+    suspend fun markFailed(
+        id: Int,
+        message: String,
+    ) {
+        ensureLoaded()
+        mutex.withLock {
+            val current = documents[id] ?: return@withLock
+            documents[id] = current.copy(status = "failed", errorMessage = message, processedAt = Instant.now().toString())
+            persist()
+        }
+    }
+
     private suspend fun saveToDisk(
         path: String,
         content: String,
@@ -680,6 +738,19 @@ class DocumentRepository(
         withContext(Dispatchers.IO) {
             runCatching {
                 File(path).writeText(content)
+            }.onFailure { ex ->
+                logger.warn(ex) { "Failed to persist document at $path" }
+            }
+        }
+    }
+
+    private suspend fun saveBytes(
+        path: String,
+        data: ByteArray,
+    ) {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                File(path).writeBytes(data)
             }.onFailure { ex ->
                 logger.warn(ex) { "Failed to persist document at $path" }
             }
@@ -784,6 +855,13 @@ private fun Route.userRoutes(repository: UserRepository) {
     }
 }
 
+private suspend fun ApplicationCall.currentUser(userRepository: UserRepository): User? {
+    val authHeader = request.headers[HttpHeaders.Authorization] ?: return null
+    val token = authHeader.removePrefix("Bearer").trim()
+    val username = TokenService.usernameFromToken(token) ?: return null
+    return userRepository.find(username)
+}
+
 @Serializable
 private data class CreateThreadRequest(
     val title: String,
@@ -800,48 +878,61 @@ private data class CreateChatRequest(
     val sender: String? = "user",
 )
 
-private fun Route.chatRoutes(repository: ChatRepository) {
+private fun Route.chatRoutes(
+    userRepository: UserRepository,
+    chatRepository: ChatRepository,
+) {
     route("/chats") {
         get("/") {
             val chats =
-                repository
+                chatRepository
                     .allThreads()
                     .flatMap { it.chats }
             call.respond(mapOf("chats" to chats))
         }
         get("/recent") {
-            call.respond(mapOf("threads" to repository.recentThreads()))
+            call.respond(mapOf("threads" to chatRepository.recentThreads()))
         }
         route("/threads") {
             get {
-                call.respond(mapOf("threads" to repository.allThreads()))
+                call.respond(mapOf("threads" to chatRepository.allThreads()))
             }
             post {
+                val currentUser = call.currentUser(userRepository)
+                if (currentUser == null || currentUser.id == null) {
+                    call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
+                    return@post
+                }
                 val req = call.receive<CreateThreadRequest>()
-                val thread = repository.addThread(req.title)
+                val thread = chatRepository.addThread(req.title, currentUser.id)
                 call.respond(HttpStatusCode.Created, thread)
             }
             get("/{thread_uuid}") {
                 val id = call.parameters["thread_uuid"]
-                val thread = id?.let { repository.thread(it) }
+                val thread = id?.let { chatRepository.thread(it) }
                 if (thread == null) call.respond(HttpStatusCode.NotFound) else call.respond(thread)
             }
             put("/{thread_uuid}") {
                 val id = call.parameters["thread_uuid"]
                 val req = call.receive<UpdateThreadRequest>()
-                val updated = id?.let { repository.updateThreadTitle(it, req.title) }
+                val updated = id?.let { chatRepository.updateThreadTitle(it, req.title) }
                 if (updated == null) call.respond(HttpStatusCode.NotFound) else call.respond(updated)
             }
             delete("/{thread_uuid}") {
                 val id = call.parameters["thread_uuid"]
-                val deleted = id?.let { repository.markDeleted(it) }
+                val deleted = id?.let { chatRepository.markDeleted(it) }
                 if (deleted == null) call.respond(HttpStatusCode.NotFound) else call.respond(deleted)
             }
         }
         post("/chat/{thread_uuid}") {
             val id = call.parameters["thread_uuid"]
             val req = call.receive<CreateChatRequest>()
-            val message = id?.let { repository.addChat(it, req.content, req.sender ?: "user") }
+            val currentUser = call.currentUser(userRepository)
+            if (currentUser == null || currentUser.id == null) {
+                call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
+                return@post
+            }
+            val message = id?.let { chatRepository.addChat(it, req.content, req.sender ?: "user", currentUser.id) }
             if (message == null) {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "Thread not found"))
             } else {
@@ -856,7 +947,6 @@ private data class UploadDocumentRequest(
     val name: String,
     val content: String,
     val contentType: String? = "text/plain",
-    val userId: Int? = 1,
 )
 
 @Serializable
@@ -899,6 +989,7 @@ private data class GraphResponse(
 private fun Route.documentRoutes(
     repository: DocumentRepository,
     rag: PathRAG,
+    userRepository: UserRepository,
 ) {
     route("/documents") {
         get("/") {
@@ -906,9 +997,65 @@ private fun Route.documentRoutes(
         }
         post("/upload") {
             val req = call.receive<UploadDocumentRequest>()
-            val doc = repository.add(req.name, req.content, req.contentType ?: "text/plain", req.userId ?: 1)
-            launch { rag.ainsert(req.content) }
+            val currentUser = call.currentUser(userRepository)
+            if (currentUser == null || currentUser.id == null) {
+                call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
+                return@post
+            }
+            val doc = repository.add(req.name, req.content, req.contentType ?: "text/plain", currentUser.id)
+            launch {
+                runCatching { rag.ainsert(req.content) }
+                    .onSuccess { repository.markProcessed(doc.id) }
+                    .onFailure { ex ->
+                        logger.warn(ex) { "Failed to ingest uploaded document ${doc.id}" }
+                        repository.markFailed(doc.id, ex.message ?: "Ingestion failed")
+                    }
+            }
             call.respond(HttpStatusCode.Created, doc)
+        }
+        post("/upload-file") {
+            val currentUser = call.currentUser(userRepository)
+            if (currentUser == null || currentUser.id == null) {
+                call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
+                return@post
+            }
+            val multipart = call.receiveMultipart()
+            var saved: DocumentInfo? = null
+            while (true) {
+                val part = multipart.readPart() ?: break
+                try {
+                    when (part) {
+                        is PartData.FileItem -> {
+                            if (saved == null) {
+                                val bytes = withContext(Dispatchers.IO) { part.provider().readBytes() }
+                                val filename = part.originalFileName ?: "upload_${System.currentTimeMillis()}"
+                                val contentType = part.contentType?.toString()
+                                saved = repository.addFile(filename, bytes, contentType, currentUser.id)
+                                launch {
+                                    runCatching {
+                                        val text = String(bytes, StandardCharsets.UTF_8)
+                                        rag.ainsert(text)
+                                    }.onSuccess { repository.markProcessed(saved.id) }
+                                        .onFailure { ex ->
+                                            logger.warn(ex) { "Failed to ingest uploaded file $filename into RAG" }
+                                            repository.markFailed(saved.id, ex.message ?: "Ingestion failed")
+                                        }
+                                }
+                            }
+                        }
+
+                        else -> {}
+                    }
+                } finally {
+                    part.dispose()
+                }
+            }
+            val doc = saved
+            if (doc == null) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No file found in request"))
+            } else {
+                call.respond(HttpStatusCode.Created, doc)
+            }
         }
         post("/query") {
             val req = call.receive<QueryRequest>()
@@ -932,7 +1079,7 @@ private fun Route.documentRoutes(
 }
 
 private fun Route.knowledgeGraphRoutes(rag: PathRAG) {
-    get("/knowledge-graph") {
+    suspend fun respondGraph(call: ApplicationCall) {
         val g = rag.graph()
         val nodeIds = g.nodes()
         val nodes =
@@ -954,19 +1101,53 @@ private fun Route.knowledgeGraphRoutes(rag: PathRAG) {
                 }
         call.respond(GraphResponse(nodes, edges))
     }
-    post("/knowledge-graph/query") {
-        val payload = runCatching { call.receive<KnowledgeGraphQuery>() }.getOrNull()
-        val question = payload?.query ?: payload?.q
-        if (question.isNullOrBlank()) {
-            call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing 'query' in payload"))
-        } else {
-            val result = rag.query(question, QueryParam(mode = "hybrid"))
-            call.respond(mapOf("answer" to result))
+    route("/knowledge-graph") {
+        get { respondGraph(call) }
+        get("/") { respondGraph(call) } // tolerate trailing slash
+        post("/query") {
+            val payload = runCatching { call.receive<KnowledgeGraphQuery>() }.getOrNull()
+            val question = payload?.query ?: payload?.q
+            if (question.isNullOrBlank()) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing 'query' in payload"))
+            } else {
+                val result = rag.query(question, QueryParam(mode = "hybrid"))
+                call.respond(mapOf("answer" to result))
+            }
         }
     }
 }
 
 private fun toStringMap(data: Map<String, Any?>?): Map<String, String> = data?.mapValues { (_, v) -> v?.toString() ?: "" } ?: emptyMap()
+
+private suspend fun preloadKnowledgeGraphIfEmpty(
+    rag: PathRAG,
+    documentRepository: DocumentRepository,
+) {
+    val g = rag.graph()
+    val hasNodes =
+        runCatching { g.nodes().isNotEmpty() }
+            .onFailure { ex -> logger.warn(ex) { "Failed to inspect knowledge graph; skipping preload." } }
+            .getOrDefault(false)
+    if (hasNodes) return
+
+    val docs =
+        runCatching { documentRepository.all() }
+            .onFailure { ex -> logger.warn(ex) { "Failed to load documents for graph preload." } }
+            .getOrDefault(emptyList())
+    if (docs.isEmpty()) return
+
+    logger.info { "Knowledge graph empty; preloading from ${docs.size} documents." }
+    docs.forEach { doc ->
+        runCatching {
+            val content = File(doc.filePath).takeIf { it.exists() }?.readText()
+            if (!content.isNullOrBlank()) {
+                rag.ainsert(content)
+            } else {
+                logger.warn { "Skipping preload for document ${doc.id}; file missing or empty at ${doc.filePath}" }
+            }
+        }.onFailure { ex -> logger.warn(ex) { "Failed to ingest document ${doc.id} for graph preload." } }
+    }
+}
 
 /**
  * Minimal .env loader that emulates python-dotenv behavior for local development.

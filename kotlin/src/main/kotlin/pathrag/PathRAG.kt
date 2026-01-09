@@ -102,6 +102,22 @@ class PathRAG(
 
     private val llmResponseCache = ResponseCache(globalConfig())
 
+    private data class CustomKgEntity(
+        val entityName: String,
+        val entityType: String,
+        val description: String,
+        val sourceId: String,
+    )
+
+    private data class CustomKgRelationship(
+        val srcId: String,
+        val tgtId: String,
+        val description: String,
+        val keywords: String,
+        val weight: Double,
+        val sourceId: String,
+    )
+
     private fun createKvStorage(namespace: String): BaseKVStorage<Map<String, Any>> =
         when (kvStorage) {
             "JsonKVStorage" -> JsonKVStorage(namespace, globalConfig(), embeddingFunc)
@@ -204,8 +220,14 @@ class PathRAG(
 
     suspend fun ainsertCustomKg(customKg: Map<String, Any?>) {
         val chunks = (customKg["chunks"] as? List<Map<String, Any?>>).orEmpty()
-        val entities = (customKg["entities"] as? List<Map<String, Any?>>).orEmpty()
-        val relationships = (customKg["relationships"] as? List<Map<String, Any?>>).orEmpty()
+        val entities =
+            (customKg["entities"] as? List<Map<String, Any?>>)
+                ?.mapNotNull { it.toCustomEntity() }
+                .orEmpty()
+        val relationships =
+            (customKg["relationships"] as? List<Map<String, Any?>>)
+                ?.mapNotNull { it.toCustomRelationship() }
+                .orEmpty()
 
         val chunkData =
             chunks.associate { chunk ->
@@ -224,30 +246,52 @@ class PathRAG(
         }
 
         entities.forEach { entity ->
-            val name = "\"${entity["entity_name"].toString().uppercase()}\""
+            val name = entity.entityName.trim('"').uppercase()
             val nodeData =
                 mapOf(
-                    "entity_type" to (entity["entity_type"] ?: "UNKNOWN"),
-                    "description" to (entity["description"] ?: "No description provided"),
-                    "source_id" to (entity["source_id"] ?: "UNKNOWN"),
+                    "entity_type" to entity.entityType.ifBlank { "UNKNOWN" },
+                    "description" to entity.description.ifBlank { "No description provided" },
+                    "source_id" to entity.sourceId.ifBlank { "UNKNOWN" },
                 )
             runCatching { chunkEntityRelationGraph.upsertNode(name, nodeData) }
                 .onFailure { ex -> logger.error(ex) { "Failed to upsert node $name" } }
         }
 
         relationships.forEach { rel ->
-            val src = "\"${rel["src_id"].toString().uppercase()}\""
-            val tgt = "\"${rel["tgt_id"].toString().uppercase()}\""
+            val src = rel.srcId.trim('"').uppercase()
+            val tgt = rel.tgtId.trim('"').uppercase()
             val data =
                 mapOf(
-                    "weight" to (rel["weight"] ?: 1.0),
-                    "description" to (rel["description"] ?: ""),
-                    "keywords" to (rel["keywords"] ?: ""),
-                    "source_id" to (rel["source_id"] ?: "UNKNOWN"),
+                    "weight" to rel.weight,
+                    "description" to rel.description,
+                    "keywords" to rel.keywords,
+                    "source_id" to rel.sourceId.ifBlank { "UNKNOWN" },
                 )
             runCatching { chunkEntityRelationGraph.upsertEdge(src, tgt, data) }
                 .onFailure { ex -> logger.error(ex) { "Failed to upsert edge $src -> $tgt" } }
         }
+    }
+
+    private fun Map<String, Any?>.toCustomEntity(): CustomKgEntity? {
+        val name = this["entity_name"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val type = this["entity_type"]?.toString().orEmpty()
+        val desc = this["description"]?.toString().orEmpty()
+        val sourceId = this["source_id"]?.toString().orEmpty()
+        return CustomKgEntity(name, type, desc, sourceId)
+    }
+
+    private fun Map<String, Any?>.toCustomRelationship(): CustomKgRelationship? {
+        val src = this["src_id"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val tgt = this["tgt_id"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val desc = this["description"]?.toString().orEmpty()
+        val keywords = this["keywords"]?.toString().orEmpty()
+        val weight =
+            this["weight"]
+                ?.toString()
+                ?.toDoubleOrNull()
+                ?: 1.0
+        val sourceId = this["source_id"]?.toString().orEmpty()
+        return CustomKgRelationship(src, tgt, desc, keywords, weight, sourceId)
     }
 
     fun query(
@@ -355,7 +399,7 @@ class PathRAG(
         entityType: String = "UNKNOWN",
         sourceId: String? = null,
     ) {
-        val key = "\"${entityName.trim('"').uppercase()}\""
+        val key = entityName.trim('"').uppercase()
         val nodeData =
             mapOf(
                 "entity_type" to entityType,
@@ -398,8 +442,8 @@ class PathRAG(
         weight: Double = 1.0,
         sourceId: String? = null,
     ) {
-        val srcKey = "\"${srcId.trim('"').uppercase()}\""
-        val tgtKey = "\"${tgtId.trim('"').uppercase()}\""
+        val srcKey = srcId.trim('"').uppercase()
+        val tgtKey = tgtId.trim('"').uppercase()
         val data =
             mapOf(
                 "weight" to weight,
