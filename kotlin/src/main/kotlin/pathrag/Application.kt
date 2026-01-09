@@ -871,6 +871,18 @@ private suspend fun ApplicationCall.currentUser(userRepository: UserRepository):
     return userRepository.find(username)
 }
 
+private suspend fun ApplicationCall.withAuthenticatedUser(
+    userRepository: UserRepository,
+    block: suspend (User) -> Unit,
+) {
+    val user = currentUser(userRepository)
+    if (user?.id == null) {
+        respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
+        return
+    }
+    block(user)
+}
+
 @Serializable
 private data class CreateThreadRequest(
     val title: String,
@@ -893,42 +905,33 @@ private fun Route.chatRoutes(
 ) {
     route("/chats") {
         get("/") {
-            val currentUser = call.currentUser(userRepository)
-            if (currentUser == null || currentUser.id == null) {
-                call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
-                return@get
-            }
-            val chats =
-                chatRepository
-                    .allThreads()
-                    .filter { it.userId == currentUser.id }
-                    .flatMap { it.chats }
-            call.respond(mapOf("chats" to chats))
-        }
-        get("/recent") {
-            val currentUser = call.currentUser(userRepository)
-            if (currentUser == null || currentUser.id == null) {
-                call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
-                return@get
-            }
-            val threads =
-                chatRepository
-                    .recentThreads()
-                    .filter { it.userId == currentUser.id }
-            call.respond(mapOf("threads" to threads))
-        }
-        route("/threads") {
-            get {
-                val currentUser = call.currentUser(userRepository)
-                if (currentUser == null || currentUser.id == null) {
-                    call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
-                    return@get
-                }
-                val threads =
+            call.withAuthenticatedUser(userRepository) { currentUser ->
+                val chats =
                     chatRepository
                         .allThreads()
                         .filter { it.userId == currentUser.id }
+                        .flatMap { it.chats }
+                call.respond(mapOf("chats" to chats))
+            }
+        }
+        get("/recent") {
+            call.withAuthenticatedUser(userRepository) { currentUser ->
+                val threads =
+                    chatRepository
+                        .recentThreads()
+                        .filter { it.userId == currentUser.id }
                 call.respond(mapOf("threads" to threads))
+            }
+        }
+        route("/threads") {
+            get {
+                call.withAuthenticatedUser(userRepository) { currentUser ->
+                    val threads =
+                        chatRepository
+                            .allThreads()
+                            .filter { it.userId == currentUser.id }
+                    call.respond(mapOf("threads" to threads))
+                }
             }
             post {
                 val currentUser = call.currentUser(userRepository)
@@ -1036,13 +1039,10 @@ private fun Route.documentRoutes(
 ) {
     route("/documents") {
         get("/") {
-            val currentUser = call.currentUser(userRepository)
-            if (currentUser == null || currentUser.id == null) {
-                call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid or missing token"))
-                return@get
+            call.withAuthenticatedUser(userRepository) { currentUser ->
+                val docs = repository.all().filter { it.userId == currentUser.id }
+                call.respond(mapOf("documents" to docs))
             }
-            val docs = repository.all().filter { it.userId == currentUser.id }
-            call.respond(mapOf("documents" to docs))
         }
         post("/upload") {
             val req = call.receive<UploadDocumentRequest>()
@@ -1069,38 +1069,37 @@ private fun Route.documentRoutes(
                 return@post
             }
             val multipart = call.receiveMultipart()
-            var saved: DocumentInfo? = null
+            val savedDocs = mutableListOf<DocumentInfo>()
             while (true) {
                 val part = multipart.readPart() ?: break
                 try {
                     when (part) {
                         is PartData.FileItem -> {
-                            if (saved == null) {
-                                val contentType = part.contentType
-                                if (!isSupportedTextContent(contentType)) {
-                                    call.respond(
-                                        HttpStatusCode.UnsupportedMediaType,
-                                        mapOf(
-                                            "error" to
-                                                "Unsupported content type '${contentType ?: "unknown"}'. Only text uploads are accepted.",
-                                        ),
-                                    )
-                                    return@post
-                                }
-                                val bytes = withContext(Dispatchers.IO) { part.provider().readBytes() }
-                                val filename = part.originalFileName ?: "upload_${System.currentTimeMillis()}"
-                                saved = repository.addFile(filename, bytes, contentType?.toString(), currentUser.id)
-                                launch {
-                                    runCatching {
-                                        val charset = contentType?.charset() ?: StandardCharsets.UTF_8
-                                        val text = String(bytes, charset)
-                                        rag.ainsert(text)
-                                    }.onSuccess { repository.markProcessed(saved.id) }
-                                        .onFailure { ex ->
-                                            logger.warn(ex) { "Failed to ingest uploaded file $filename into RAG" }
-                                            repository.markFailed(saved.id, ex.message ?: "Ingestion failed")
-                                        }
-                                }
+                            val contentType = part.contentType
+                            if (!isSupportedTextContent(contentType)) {
+                                call.respond(
+                                    HttpStatusCode.UnsupportedMediaType,
+                                    mapOf(
+                                        "error" to
+                                            "Unsupported content type '${contentType ?: "unknown"}'. Only text uploads are accepted.",
+                                    ),
+                                )
+                                return@post
+                            }
+                            val bytes = withContext(Dispatchers.IO) { part.provider().readBytes() }
+                            val filename = part.originalFileName ?: "upload_${System.currentTimeMillis()}"
+                            val saved = repository.addFile(filename, bytes, contentType?.toString(), currentUser.id)
+                            savedDocs.add(saved)
+                            launch {
+                                runCatching {
+                                    val charset = contentType?.charset() ?: StandardCharsets.UTF_8
+                                    val text = String(bytes, charset)
+                                    rag.ainsert(text)
+                                }.onSuccess { repository.markProcessed(saved.id) }
+                                    .onFailure { ex ->
+                                        logger.warn(ex) { "Failed to ingest uploaded file $filename into RAG" }
+                                        repository.markFailed(saved.id, ex.message ?: "Ingestion failed")
+                                    }
                             }
                         }
 
@@ -1110,11 +1109,10 @@ private fun Route.documentRoutes(
                     part.dispose()
                 }
             }
-            val doc = saved
-            if (doc == null) {
+            if (savedDocs.isEmpty()) {
                 call.respond(HttpStatusCode.BadRequest, mapOf("error" to "No file found in request"))
             } else {
-                call.respond(HttpStatusCode.Created, doc)
+                call.respond(HttpStatusCode.Created, mapOf("documents" to savedDocs))
             }
         }
         post("/query") {
