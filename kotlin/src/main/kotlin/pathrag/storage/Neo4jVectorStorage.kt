@@ -2,6 +2,7 @@ package pathrag.storage
 
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.neo4j.driver.AuthTokens
 import org.neo4j.driver.Driver
@@ -148,29 +149,39 @@ class Neo4jVectorStorage(
         write { tx -> tx.run("MATCH (v:$nodeLabel) DETACH DELETE v") }
     }
 
-    private suspend fun ensureVectorIndex(dimension: Int) {
-        if (dimension <= 0) return
-        val exists =
+    private suspend fun vectorIndexState(): String? =
+        runCatching {
             read { tx ->
                 tx
-                    .run(
-                        "CALL db.indexes() " +
-                            "YIELD name, type, labelsOrTypes, properties " +
-                            "WHERE name = \$name AND type = 'VECTOR' AND \$label IN labelsOrTypes AND 'embedding' IN properties " +
-                            "RETURN name",
-                        Values.parameters("name", vectorIndexName, "label", nodeLabel),
-                    ).list()
-                    .isNotEmpty()
+                    .run("SHOW VECTOR INDEXES WHERE name = \$name RETURN state", Values.parameters("name", vectorIndexName))
+                    .list()
+                    .firstOrNull()
+                    ?.get("state")
+                    ?.asString()
             }
-        if (exists) return
-        write { tx ->
-            tx.run(
-                "CREATE VECTOR INDEX $vectorIndexName IF NOT EXISTS FOR (v:$nodeLabel) ON (v.embedding) " +
-                    "OPTIONS {indexConfig: {`vector.dimensions`: \$dim, `vector.similarity_function`: 'cosine'}}",
-                Values.parameters("dim", dimension),
-            )
+        }.getOrNull()
+
+    private suspend fun ensureVectorIndex(dimension: Int) {
+        if (dimension <= 0) return
+        val currentState = vectorIndexState()
+        if (currentState?.equals("ONLINE", ignoreCase = true) == true) return
+        if (currentState == null) {
+            write { tx ->
+                tx.run(
+                    "CREATE VECTOR INDEX $vectorIndexName IF NOT EXISTS FOR (v:$nodeLabel) ON (v.embedding) " +
+                        "OPTIONS {indexConfig: {`vector.dimensions`: \$dim, `vector.similarity_function`: 'cosine'}}",
+                    Values.parameters("dim", dimension),
+                )
+            }
+            logger.info { "Created Neo4j vector index $vectorIndexName for label $nodeLabel with dimension $dimension" }
         }
-        logger.info { "Created Neo4j vector index $vectorIndexName for label $nodeLabel with dimension $dimension" }
+        repeat(10) {
+            val state = vectorIndexState()
+            if (state?.equals("ONLINE", ignoreCase = true) == true) return
+            delay(200)
+        }
+        val finalState = vectorIndexState()
+        logger.warn { "Neo4j vector index $vectorIndexName not ONLINE after wait; last observed state=$finalState" }
     }
 
     private suspend fun queryWithIndex(
@@ -220,12 +231,15 @@ class Neo4jVectorStorage(
         a: DoubleArray,
         b: DoubleArray,
     ): Double {
-        if (a.isEmpty() || b.isEmpty()) return 0.0
-        val minLen = minOf(a.size, b.size)
+        if (a.size != b.size) {
+            logger.warn { "Cannot compute cosine similarity for vectors of different dimensions: ${a.size} vs ${b.size}" }
+            return 0.0
+        }
+        if (a.isEmpty()) return 0.0
         var dot = 0.0
         var normA = 0.0
         var normB = 0.0
-        for (i in 0 until minLen) {
+        for (i in a.indices) {
             dot += a[i] * b[i]
             normA += a[i] * a[i]
             normB += b[i] * b[i]

@@ -324,7 +324,7 @@ class PathRAG(
     fun deleteByEntity(entityName: String) = runBlockingMaybe { adeleteByEntity(entityName) }
 
     suspend fun adeleteByEntity(entityName: String) {
-        val key = "\"${entityName.uppercase()}\""
+        val key = entityName.trim('"').uppercase()
         entitiesVdb.deleteEntity(key)
         relationshipsVdb.deleteRelation(key)
         chunkEntityRelationGraph.deleteNode(key)
@@ -340,8 +340,8 @@ class PathRAG(
         srcId: String,
         tgtId: String,
     ) {
-        val srcKey = "\"${srcId.uppercase()}\""
-        val tgtKey = "\"${tgtId.uppercase()}\""
+        val srcKey = srcId.trim('"').uppercase()
+        val tgtKey = tgtId.trim('"').uppercase()
         relationshipsVdb.deleteRelationBetween(srcKey, tgtKey)
         chunkEntityRelationGraph.deleteEdge(srcKey, tgtKey)
         logger.info { "Edge '$srcKey' -> '$tgtKey' deleted." }

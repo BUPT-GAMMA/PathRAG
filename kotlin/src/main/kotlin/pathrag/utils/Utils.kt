@@ -33,11 +33,20 @@ data class EmbeddingFunc(
     suspend operator fun invoke(inputs: List<String>): List<DoubleArray> {
         val exec: suspend () -> List<DoubleArray> = { func(inputs) }
         val lock = semaphore
-        return if (lock == null) {
-            exec()
-        } else {
-            lock.withPermit { exec() }
+        val vectors =
+            if (lock == null) {
+                exec()
+            } else {
+                lock.withPermit { exec() }
+            }
+        vectors.forEachIndexed { idx, vec ->
+            if (vec.size != embeddingDim) {
+                val message = "Embedding dimension mismatch at index $idx: expected $embeddingDim, got ${vec.size}"
+                log().error { message }
+                throw IllegalStateException(message)
+            }
         }
+        return vectors
     }
 }
 
