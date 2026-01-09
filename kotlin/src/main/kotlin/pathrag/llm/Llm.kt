@@ -215,7 +215,8 @@ suspend fun ollamaEmbedding(inputs: List<String>): List<DoubleArray> {
             }
         }.onFailure { ex ->
             logger.warn(ex) { "Ollama embedding call failed for model $modelName" }
-        }.getOrDefault(emptyList())
+            throw IllegalStateException("Ollama embedding call failed for model $modelName", ex)
+        }.getOrThrow()
     }
 }
 

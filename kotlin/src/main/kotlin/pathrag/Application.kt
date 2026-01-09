@@ -99,10 +99,28 @@ fun Application.module(env: EnvironmentConfig = EnvironmentConfig.empty()) {
     val uploadDir = env["UPLOAD_DIR"] ?: "./uploads"
     createDirectories(listOf(workingDir, uploadDir))
 
-    val rag = PathRAG(workingDir = workingDir)
+    val kvStorage = env["KV_STORAGE"] ?: "JsonKVStorage"
+    val vectorStorage = env["VECTOR_STORAGE"] ?: "NanoVectorDBStorage"
+    val graphStorage = env["GRAPH_STORAGE"] ?: "NetworkXStorage"
+    val neo4jConfig =
+        mapOf(
+            "neo4j_uri" to env["NEO4J_URI"],
+            "neo4j_user" to env["NEO4J_USER"],
+            "neo4j_password" to env["NEO4J_PASSWORD"],
+        ).filterValues { !it.isNullOrBlank() }
+
+    val rag =
+        PathRAG(
+            workingDir = workingDir,
+            kvStorage = kvStorage,
+            vectorStorage = vectorStorage,
+            graphStorage = graphStorage,
+            extraConfig = neo4jConfig,
+        )
     val userRepository = UserRepository(Paths.get(workingDir, "users.json"))
     val chatRepository = ChatRepository(Paths.get(workingDir, "chats.json"))
     val documentRepository = DocumentRepository(uploadDir, Paths.get(workingDir, "documents.json"))
+    TokenService.configure(env)
     runBlocking { createDefaultUsers(userRepository) }
 
     routing {
@@ -120,8 +138,10 @@ fun Application.module(env: EnvironmentConfig = EnvironmentConfig.empty()) {
 }
 
 private fun warnOnMissingRequiredVars(env: EnvironmentConfig) {
-    val required = listOf("SECRET_KEY")
-    val missing = required.filter { env[it].isNullOrBlank() }
+    val missing =
+        buildList {
+            if (!SecretKeyLoader.hasSecret(env)) add("SECRET_KEY_FILE (preferred) or SECRET_KEY")
+        }
     if (missing.isNotEmpty()) {
         logger.warn { "Missing required environment variables: ${missing.joinToString(", ")}" }
         logger.warn { "Please set these variables in your .env file or environment. See sample.env for an example configuration." }
@@ -155,6 +175,8 @@ class UserRepository(
             prettyPrint = true
             ignoreUnknownKeys = true
         }
+
+    @Volatile
     private var initialized = false
 
     suspend fun count(): Int {
@@ -293,15 +315,80 @@ object PasswordHasher {
     }
 }
 
+private object SecretKeyLoader {
+    fun load(env: EnvironmentConfig): ByteArray {
+        val secretFromFile =
+            env["SECRET_KEY_FILE"]?.takeIf { it.isNotBlank() }?.let { pathString ->
+                val path = runCatching { Paths.get(pathString) }.getOrNull()
+                if (path == null) {
+                    logger.error { "SECRET_KEY_FILE path is invalid: $pathString" }
+                    null
+                } else {
+                    runCatching { Files.readString(path).trim() }
+                        .onFailure { ex -> logger.error(ex) { "Failed to read SECRET_KEY_FILE at $pathString" } }
+                        .getOrNull()
+                        ?.takeIf { it.isNotBlank() }
+                }
+            }
+        if (secretFromFile != null) {
+            return secretFromFile.toByteArray(StandardCharsets.UTF_8)
+        }
+
+        val envSecret = env["SECRET_KEY"]?.takeIf { it.isNotBlank() }
+        if (envSecret != null) {
+            return envSecret.toByteArray(StandardCharsets.UTF_8)
+        }
+
+        logger.warn {
+            "No SECRET_KEY_FILE configured and SECRET_KEY missing. Generated ephemeral secret; tokens will be invalidated on restart."
+        }
+        return UUID.randomUUID().toString().toByteArray(StandardCharsets.UTF_8)
+    }
+
+    fun hasSecret(env: EnvironmentConfig): Boolean {
+        val fileSecretPresent =
+            env["SECRET_KEY_FILE"]?.takeIf { it.isNotBlank() }?.let { pathString ->
+                val path = runCatching { Paths.get(pathString) }.getOrNull() ?: return@let false
+                if (!Files.exists(path)) return@let false
+                val content = runCatching { Files.readString(path).trim() }.getOrNull()
+                !content.isNullOrBlank()
+            } ?: false
+
+        return fileSecretPresent || !env["SECRET_KEY"].isNullOrBlank()
+    }
+}
+
 object TokenService {
-    private val secret: ByteArray =
-        (System.getenv("SECRET_KEY") ?: UUID.randomUUID().toString()).toByteArray(StandardCharsets.UTF_8)
     private val encoder = Base64.getUrlEncoder().withoutPadding()
     private val decoder = Base64.getUrlDecoder()
 
+    private const val DEFAULT_TOKEN_TTL_MINUTES = 30L
+
+    @Volatile
+    private var secret: ByteArray? = null
+
+    @Volatile
+    private var tokenTtlSeconds: Long = DEFAULT_TOKEN_TTL_MINUTES * 60
+
+    fun configure(env: EnvironmentConfig) {
+        if (secret == null) {
+            secret = SecretKeyLoader.load(env)
+        }
+        tokenTtlSeconds =
+            env["ACCESS_TOKEN_EXPIRE_MINUTES"]?.toLongOrNull()?.takeIf { it > 0 }?.times(60)
+                ?: DEFAULT_TOKEN_TTL_MINUTES * 60
+    }
+
+    private fun secret(): ByteArray =
+        secret ?: synchronized(this) {
+            secret ?: SecretKeyLoader.load(EnvironmentConfig.empty()).also { secret = it }
+        }
+
     fun issueToken(username: String): String {
+        val issuedAt = Instant.now()
+        val expiresAt = issuedAt.plusSeconds(tokenTtlSeconds)
         val nonce = UUID.randomUUID().toString()
-        val payload = "$username:$nonce:${Instant.now()}"
+        val payload = listOf(username, nonce, issuedAt.toString(), expiresAt.toString()).joinToString("|")
         val signature = hmacSha256(payload.toByteArray(StandardCharsets.UTF_8))
         return "${encoder.encodeToString(payload.toByteArray(StandardCharsets.UTF_8))}.${encoder.encodeToString(signature)}"
     }
@@ -316,12 +403,17 @@ object TokenService {
         val expected = hmacSha256(payloadBytes)
         if (!expected.contentEquals(providedSignature)) return null
         val payload = payloadBytes.toString(StandardCharsets.UTF_8)
-        return payload.substringBefore(":")
+        val segments = payload.split("|")
+        if (segments.size < 4) return null
+        val username = segments[0]
+        val expiresAt = runCatching { Instant.parse(segments[3]) }.getOrNull() ?: return null
+        if (Instant.now().isAfter(expiresAt)) return null
+        return username
     }
 
     private fun hmacSha256(data: ByteArray): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(secret, "HmacSHA256"))
+        mac.init(SecretKeySpec(secret(), "HmacSHA256"))
         return mac.doFinal(data)
     }
 }
@@ -393,6 +485,8 @@ class ChatRepository(
             prettyPrint = true
             ignoreUnknownKeys = true
         }
+
+    @Volatile
     private var initialized = false
 
     suspend fun allThreads(): List<ChatThread> {
@@ -534,6 +628,8 @@ class DocumentRepository(
             prettyPrint = true
             ignoreUnknownKeys = true
         }
+
+    @Volatile
     private var initialized = false
 
     suspend fun all(): List<DocumentInfo> {

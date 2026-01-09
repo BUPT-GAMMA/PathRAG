@@ -60,6 +60,7 @@ class PathRAG(
             "language" to language, // follow top-level language
             "example_number" to (System.getenv("KEYWORD_EXAMPLE_COUNT")?.toIntOrNull() ?: 3),
         ),
+    private val extraConfig: Map<String, Any?> = emptyMap(),
 ) {
     private val logger = KotlinLogging.logger("PathRAG")
     private val llmProvider: String = System.getenv("LLM_PROVIDER")?.lowercase() ?: "openai"
@@ -144,7 +145,7 @@ class PathRAG(
             "similarity_check_prompt" to similarityCheckPrompt,
             "fixed_high_level_keywords" to highLevelKeywords,
             "fixed_low_level_keywords" to lowLevelKeywords,
-        )
+        ).plus(extraConfig)
 
     fun insert(stringOrStrings: Any) = runBlockingMaybe { ainsert(stringOrStrings) }
 
@@ -168,15 +169,17 @@ class PathRAG(
             }
         val chunkMap = mutableMapOf<String, Map<String, Any>>()
         newDocs.forEach { (docKey, doc) ->
+            val content = doc["content"] as String
             val chunks =
                 chunkingByTokenSize(
-                    doc["content"]?.toString().orEmpty(),
+                    content,
                     overlapTokenSize = chunkOverlapTokenSize,
                     maxTokenSize = chunkTokenSize,
                 )
             chunks.forEach { chunk ->
-                val id = computeMdHashId(chunk["content"].toString(), prefix = "chunk-")
-                chunkMap[id] = chunk + mapOf("full_doc_id" to docKey)
+                val content = (chunk["content"] as? String)?.trim().orEmpty()
+                val id = computeMdHashId(content, prefix = "chunk-")
+                chunkMap[id] = chunk + mapOf("content" to content, "full_doc_id" to docKey)
             }
         }
         try {
@@ -206,8 +209,9 @@ class PathRAG(
 
         val chunkData =
             chunks.associate { chunk ->
-                val id = computeMdHashId(chunk["content"].toString(), prefix = "chunk-")
-                id to mapOf("content" to chunk["content"].toString(), "source_id" to chunk["source_id"].toString())
+                val content = (chunk["content"] as? String)?.trim().orEmpty()
+                val id = computeMdHashId(content, prefix = "chunk-")
+                id to mapOf("content" to content, "source_id" to chunk["source_id"].toString())
             }
         if (chunkData.isNotEmpty()) {
             try {
@@ -228,7 +232,7 @@ class PathRAG(
                     "source_id" to (entity["source_id"] ?: "UNKNOWN"),
                 )
             runCatching { chunkEntityRelationGraph.upsertNode(name, nodeData) }
-                .onFailure { logger.error(it) { "Failed to upsert node $name" } }
+                .onFailure { ex -> logger.error(ex) { "Failed to upsert node $name" } }
         }
 
         relationships.forEach { rel ->
@@ -242,7 +246,7 @@ class PathRAG(
                     "source_id" to (rel["source_id"] ?: "UNKNOWN"),
                 )
             runCatching { chunkEntityRelationGraph.upsertEdge(src, tgt, data) }
-                .onFailure { logger.error(it) { "Failed to upsert edge $src -> $tgt" } }
+                .onFailure { ex -> logger.error(ex) { "Failed to upsert edge $src -> $tgt" } }
         }
     }
 
@@ -360,17 +364,20 @@ class PathRAG(
                 "entity_name" to key,
             )
         val vectorId = computeMdHashId(key, prefix = "ent-")
-        chunkEntityRelationGraph.upsertNode(key, nodeData)
-        entitiesVdb.upsert(
-            mapOf(
-                vectorId to
-                    mapOf(
-                        "content" to description,
-                        "entity_name" to key,
-                        "source_id" to (sourceId ?: ""),
-                    ),
-            ),
-        )
+        runCatching { chunkEntityRelationGraph.upsertNode(key, nodeData) }
+            .onFailure { ex -> logger.error(ex) { "Failed to upsert node $key" } }
+        runCatching {
+            entitiesVdb.upsert(
+                mapOf(
+                    vectorId to
+                        mapOf(
+                            "content" to description,
+                            "entity_name" to key,
+                            "source_id" to (sourceId ?: ""),
+                        ),
+                ),
+            )
+        }.onFailure { ex -> logger.error(ex) { "Failed to upsert entity vector $vectorId" } }
         logger.info { "Entity '$key' upserted." }
     }
 
@@ -400,21 +407,24 @@ class PathRAG(
                 "keywords" to keywords,
                 "source_id" to (sourceId ?: "UNKNOWN"),
             )
-        chunkEntityRelationGraph.upsertEdge(srcKey, tgtKey, data)
+        runCatching { chunkEntityRelationGraph.upsertEdge(srcKey, tgtKey, data) }
+            .onFailure { ex -> logger.error(ex) { "Failed to upsert edge $srcKey -> $tgtKey" } }
         val relId = computeMdHashId(srcKey + tgtKey, prefix = "rel-")
-        relationshipsVdb.upsert(
-            mapOf(
-                relId to
-                    mapOf(
-                        "src_id" to srcKey,
-                        "tgt_id" to tgtKey,
-                        "content" to (description + keywords),
-                        "keywords" to keywords,
-                        "description" to description,
-                        "source_id" to (sourceId ?: ""),
-                    ),
-            ),
-        )
+        runCatching {
+            relationshipsVdb.upsert(
+                mapOf(
+                    relId to
+                        mapOf(
+                            "src_id" to srcKey,
+                            "tgt_id" to tgtKey,
+                            "content" to (description + keywords),
+                            "keywords" to keywords,
+                            "description" to description,
+                            "source_id" to (sourceId ?: ""),
+                        ),
+                ),
+            )
+        }.onFailure { ex -> logger.error(ex) { "Failed to upsert relationship vector $relId" } }
         logger.info { "Edge '$srcKey' -> '$tgtKey' upserted." }
     }
 }

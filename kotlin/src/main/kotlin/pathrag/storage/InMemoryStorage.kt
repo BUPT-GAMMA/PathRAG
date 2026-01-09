@@ -8,6 +8,7 @@ import pathrag.base.BaseKVStorage
 import pathrag.base.BaseVectorStorage
 import pathrag.utils.EmbeddingFunc
 import pathrag.utils.computeMdHashId
+import pathrag.utils.computePagerankLocal
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
@@ -291,36 +292,9 @@ class NetworkXStorage(
         maxIter: Int = 100,
         tol: Double = 1e-6,
     ): Map<String, Double> {
-        val nodesList = nodes.keys().toList()
-        if (nodesList.isEmpty()) return emptyMap()
-        val n = nodesList.size
-        val adjacency =
-            nodesList.associateWith { mutableListOf<String>() }.toMutableMap().also { adj ->
-                edges.keys.forEach { (u, v) ->
-                    adj[u]?.add(v)
-                    adj[v]?.add(u)
-                }
-            }
-        val rank = mutableMapOf<String, Double>()
-        nodesList.forEach { rank[it] = 1.0 / n }
-
-        repeat(maxIter) {
-            var diff = 0.0
-            val newRank = mutableMapOf<String, Double>()
-            for (node in nodesList) {
-                val neighbors = adjacency[node].orEmpty()
-                val outDeg = neighbors.size
-                val share = if (outDeg == 0) 0.0 else rank[node]!! / outDeg
-                neighbors.forEach { dest -> newRank[dest] = (newRank[dest] ?: 0.0) + share }
-            }
-            for (node in nodesList) {
-                val updated = (1 - damping) / n + damping * (newRank[node] ?: 0.0)
-                diff += abs(updated - (rank[node] ?: 0.0))
-                rank[node] = updated
-            }
-            if (diff < tol) return rank
-        }
-        return rank
+        val nodeList = nodes.keys().toList()
+        val edgeList = edges.keys.toList()
+        return computePagerankLocal(nodeList, edgeList, damping, maxIter, tol)
     }
 
     override suspend fun drop() {

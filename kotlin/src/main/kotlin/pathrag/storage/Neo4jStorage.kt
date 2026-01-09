@@ -10,6 +10,7 @@ import org.neo4j.driver.Record
 import org.neo4j.driver.TransactionContext
 import org.neo4j.driver.Values
 import pathrag.base.BaseGraphStorage
+import pathrag.utils.computePagerankLocal
 import java.io.Closeable
 import kotlin.math.abs
 
@@ -307,7 +308,8 @@ class Neo4jStorage(
     ): Map<String, Double> {
         val gdsRanks = computePagerankGds()
         if (gdsRanks.isNotEmpty()) return gdsRanks
-        return computePagerankLocal(damping, maxIter, tol)
+        val (nodeList, edgeList) = fetchGraph()
+        return computePagerankLocal(nodeList, edgeList, damping, maxIter, tol)
     }
 
     private suspend fun computePagerankGds(): Map<String, Double> {
@@ -337,42 +339,5 @@ class Neo4jStorage(
             }.onFailure { ex -> logger.warn(ex) { "Neo4j GDS PageRank failed; falling back to in-memory computation." } }
         }
         return ranks
-    }
-
-    private suspend fun computePagerankLocal(
-        damping: Double = 0.85,
-        maxIter: Int = 100,
-        tol: Double = 1e-6,
-    ): Map<String, Double> {
-        val (nodeList, edgeList) = fetchGraph()
-        if (nodeList.isEmpty()) return emptyMap()
-        val n = nodeList.size
-        val adjacency =
-            nodeList.associateWith { mutableListOf<String>() }.toMutableMap().also { adj ->
-                edgeList.forEach { (u, v) ->
-                    adj[u]?.add(v)
-                    adj[v]?.add(u)
-                }
-            }
-        val rank = mutableMapOf<String, Double>()
-        nodeList.forEach { rank[it] = 1.0 / n }
-
-        repeat(maxIter) {
-            var diff = 0.0
-            val newRank = mutableMapOf<String, Double>()
-            for (node in nodeList) {
-                val neighbors = adjacency[node].orEmpty()
-                val outDeg = neighbors.size
-                val share = if (outDeg == 0) 0.0 else rank[node]!! / outDeg
-                neighbors.forEach { dest -> newRank[dest] = (newRank[dest] ?: 0.0) + share }
-            }
-            for (node in nodeList) {
-                val updated = (1 - damping) / n + damping * (newRank[node] ?: 0.0)
-                diff += abs(updated - (rank[node] ?: 0.0))
-                rank[node] = updated
-            }
-            if (diff < tol) return rank
-        }
-        return rank
     }
 }

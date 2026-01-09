@@ -40,6 +40,7 @@ class Neo4jVectorStorage(
     private val driver: Driver = GraphDatabase.driver(uri, AuthTokens.basic(user, password))
 
     private val nodeLabel = "${namespace.uppercase()}_VECTOR"
+    private val vectorIndexName = "${nodeLabel}_EMBED_IDX"
 
     override fun close() {
         driver.close()
@@ -65,6 +66,8 @@ class Neo4jVectorStorage(
             }
         if (embeddings.isEmpty()) return emptyList()
         val queryEmbedding = embeddings.first()
+        queryWithIndex(queryEmbedding, topK)?.let { return it }
+
         val vectors =
             read { tx ->
                 tx
@@ -95,6 +98,10 @@ class Neo4jVectorStorage(
             } catch (e: Exception) {
                 logger.error(e) { "Failed to embed content for Neo4jVectorStorage ($namespace)" }
                 throw e
+            }
+        runCatching { ensureVectorIndex(embeddings.firstOrNull()?.size ?: 0) }
+            .onFailure { ex ->
+                logger.warn(ex) { "Unable to ensure vector index for Neo4jVectorStorage ($namespace); continuing without index." }
             }
         write { tx ->
             embeddings.forEachIndexed { idx, vector ->
@@ -141,17 +148,72 @@ class Neo4jVectorStorage(
         write { tx -> tx.run("MATCH (v:$nodeLabel) DETACH DELETE v") }
     }
 
+    private suspend fun ensureVectorIndex(dimension: Int) {
+        if (dimension <= 0) return
+        val exists =
+            read { tx ->
+                tx
+                    .run(
+                        "CALL db.indexes() " +
+                            "YIELD name, type, labelsOrTypes, properties " +
+                            "WHERE name = \$name AND type = 'VECTOR' AND \$label IN labelsOrTypes AND 'embedding' IN properties " +
+                            "RETURN name",
+                        Values.parameters("name", vectorIndexName, "label", nodeLabel),
+                    ).list()
+                    .isNotEmpty()
+            }
+        if (exists) return
+        write { tx ->
+            tx.run(
+                "CREATE VECTOR INDEX $vectorIndexName IF NOT EXISTS FOR (v:$nodeLabel) ON (v.embedding) " +
+                    "OPTIONS {indexConfig: {`vector.dimensions`: \$dim, `vector.similarity_function`: 'cosine'}}",
+                Values.parameters("dim", dimension),
+            )
+        }
+        logger.info { "Created Neo4j vector index $vectorIndexName for label $nodeLabel with dimension $dimension" }
+    }
+
+    private suspend fun queryWithIndex(
+        queryEmbedding: DoubleArray,
+        topK: Int,
+    ): List<Map<String, Any?>>? =
+        runCatching {
+            ensureVectorIndex(queryEmbedding.size)
+            read { tx ->
+                tx
+                    .run(
+                        "CALL db.index.vector.queryNodes(\$indexName, \$k, \$embedding) " +
+                            "YIELD node, score " +
+                            "RETURN node, score",
+                        Values.parameters("indexName", vectorIndexName, "k", topK, "embedding", queryEmbedding.toList()),
+                    ).list { rec -> rec.toIndexedEntry() }
+            }
+        }.onFailure { ex ->
+            logger.warn(
+                ex,
+            ) { "Vector index query unavailable for Neo4jVectorStorage ($namespace); falling back to client-side similarity." }
+        }.getOrNull()
+
     private fun Record.toVectorEntry(): Map<String, Any?> {
         val props = this["props"].asNode().asMap { it.asObject() }
         val embeddingList = props["embedding"] as? List<*> ?: emptyList<Any?>()
         val embedding = embeddingList.filterIsInstance<Number>().map { it.toDouble() }.toDoubleArray()
         val meta = props.filterKeys { metaFields.contains(it) }
         return mapOf(
-            "id" to this["id"].asString(),
+            "id" to (this["id"].takeIf { !it.isNull }?.asString() ?: ""),
             "content" to props["content"]?.toString().orEmpty(),
             "embedding" to embedding,
             "meta" to meta,
         )
+    }
+
+    private fun Record.toIndexedEntry(): Map<String, Any?> {
+        val node = this["node"].asNode()
+        val props = node.asMap { it.asObject() }
+        val meta = props.filterKeys { metaFields.contains(it) }
+        val content = props["content"]?.toString().orEmpty()
+        val score = this["score"].asDouble()
+        return mapOf("content" to content, "score" to score) + meta
     }
 
     private fun cosineSimilarity(
